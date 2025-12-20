@@ -832,13 +832,17 @@ static std::vector<std::string> json_get_string_array(const std::string& json, c
 static bool write_config_prefs(const std::string& json) {
     std::string rom = json_get_string(json, "rom");
     std::vector<std::string> disks = json_get_string_array(json, "disks");
-    int ramsize = json_get_int(json, "ramsize", 32);
+    int ramsize = json_get_int(json, "ram", 32);
     std::string screen = json_get_string(json, "screen");
     int cpu = json_get_int(json, "cpu", 4);
-    int modelid = json_get_int(json, "modelid", 14);
+    int modelid = json_get_int(json, "model", 14);
     bool fpu = json_get_bool(json, "fpu", true);
     bool jit = json_get_bool(json, "jit", true);
     bool sound = json_get_bool(json, "sound", true);
+
+    // Debug: log what we received
+    fprintf(stderr, "Config: rom=%s, disks=%zu, ram=%d, screen=%s, cpu=%d, model=%d\n",
+            rom.c_str(), disks.size(), ramsize, screen.c_str(), cpu, modelid);
 
     // Parse screen resolution
     int screen_w = 800, screen_h = 600;
@@ -865,7 +869,11 @@ static bool write_config_prefs(const std::string& json) {
     }
 
     // Disk images (use absolute paths)
+    if (disks.empty()) {
+        fprintf(stderr, "Config: WARNING - no disk images specified!\n");
+    }
     for (const auto& disk : disks) {
+        fprintf(stderr, "Config: Adding disk: %s\n", disk.c_str());
         prefs << "disk " << cwd << "/" << g_images_path << "/" << disk << "\n";
     }
 
@@ -879,10 +887,65 @@ static bool write_config_prefs(const std::string& json) {
     prefs << "jit " << (jit ? "true" : "false") << "\n";
     prefs << "nosound " << (sound ? "false" : "true") << "\n";
 
-    prefs << "\n# Other defaults\n";
+    prefs << "\n# JIT settings\n";
+    prefs << "jitfpu true\n";
+    prefs << "jitcachesize 8192\n";
+    prefs << "jitlazyflush true\n";
+    prefs << "jitinline true\n";
+    prefs << "jitdebug false\n";
+
+    prefs << "\n# Display settings\n";
+    prefs << "displaycolordepth 0\n";
     prefs << "frameskip 0\n";
+    prefs << "scale_nearest false\n";
+    prefs << "scale_integer false\n";
+
+    prefs << "\n# Input settings\n";
+    prefs << "keyboardtype 5\n";
+    prefs << "keycodes false\n";
+    prefs << "mousewheelmode 1\n";
+    prefs << "mousewheellines 3\n";
+    prefs << "swap_opt_cmd true\n";
+    prefs << "hotkey 0\n";
+
+    prefs << "\n# Serial/Network\n";
     prefs << "seriala /dev/null\n";
     prefs << "serialb /dev/null\n";
+    prefs << "udptunnel false\n";
+    prefs << "udpport 6066\n";
+    prefs << "etherpermanentaddress true\n";
+    prefs << "ethermulticastmode 0\n";
+    prefs << "routerenabled false\n";
+    prefs << "ftp_port_list 21\n";
+
+    prefs << "\n# Boot settings\n";
+    prefs << "bootdrive 0\n";
+    prefs << "bootdriver 0\n";
+    prefs << "nocdrom false\n";
+
+    prefs << "\n# System settings\n";
+    prefs << "ignoresegv true\n";
+    prefs << "idlewait true\n";
+    prefs << "noclipconversion false\n";
+    prefs << "nogui true\n";
+    prefs << "sound_buffer 0\n";
+    prefs << "name_encoding 0\n";
+    prefs << "delay 0\n";
+    prefs << "init_grab false\n";
+    prefs << "yearofs 0\n";
+    prefs << "dayofs 0\n";
+    prefs << "reservewindowskey false\n";
+
+    prefs << "\n# SDL settings\n";
+    prefs << "sdlrender software\n";
+    prefs << "sdl_vsync true\n";
+
+    prefs << "\n# ExtFS settings\n";
+    prefs << "enableextfs false\n";
+    prefs << "debugextfs false\n";
+    prefs << "extfs \n";
+    prefs << "extdrives CDEFGHIJKLMNOPQRSTUVWXYZ\n";
+    prefs << "pollmedia true\n";
 
     // Write to file
     std::ofstream file(g_prefs_path);
@@ -968,10 +1031,10 @@ static std::string read_config_json() {
         json << "\"" << json_escape(disks[i]) << "\"";
     }
     json << "], ";
-    json << "\"ramsize\": " << ramsize << ", ";
+    json << "\"ram\": " << ramsize << ", ";
     json << "\"screen\": \"" << screen_w << "x" << screen_h << "\", ";
     json << "\"cpu\": " << cpu << ", ";
-    json << "\"modelid\": " << modelid << ", ";
+    json << "\"model\": " << modelid << ", ";
     json << "\"fpu\": " << (fpu ? "true" : "false") << ", ";
     json << "\"jit\": " << (jit ? "true" : "false") << ", ";
     json << "\"sound\": " << (sound ? "true" : "false");
