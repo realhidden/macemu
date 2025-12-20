@@ -4,59 +4,288 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Basilisk II - WebRTC (libdatachannel)</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            background: #1a1a1a;
-            color: #fff;
-            font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            min-height: 100vh;
-            padding: 20px;
-        }
-        h1 {
-            font-size: 1.2em;
-            margin-bottom: 10px;
-            color: #888;
-        }
-        #container {
-            background: #000;
-            border-radius: 8px;
-            overflow: hidden;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.5);
-        }
-        #screen {
-            display: block;
-            max-width: 100%;
-            max-height: 80vh;
-            cursor: none;
-        }
-        #status {
-            margin-top: 15px;
-            padding: 8px 16px;
-            background: #333;
-            border-radius: 20px;
-            font-size: 0.85em;
-            color: #aaa;
-        }
-        #status.connected { background: #234; color: #4a9; }
-        .info {
-            margin-top: 20px;
-            font-size: 0.75em;
-            color: #555;
-        }
-    </style>
+    <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-    <h1>Basilisk II Web Streaming</h1>
-    <div id="container">
-        <video id="screen" autoplay playsinline muted></video>
+    <header>
+        <div class="logo">
+            <span style="font-size: 1.5em;">&#128421;</span>
+            <h1>Basilisk II Web</h1>
+            <span class="badge">libdatachannel</span>
+        </div>
+
+        <div class="status-bar">
+            <div class="status-item">
+                <span class="status-dot" id="status-dot"></span>
+                <span id="connection-status">Disconnected</span>
+            </div>
+            <div class="status-item" id="fps-display">
+                FPS: --
+            </div>
+            <div class="status-item" id="bitrate-display">
+                -- kbps
+            </div>
+        </div>
+
+        <div class="controls">
+            <button class="btn" id="config-btn" onclick="openConfig()">Settings</button>
+            <button class="btn success" id="start-btn" onclick="startEmulator()">Start</button>
+            <button class="btn danger" id="stop-btn" onclick="stopEmulator()">Stop</button>
+            <button class="btn" id="debug-toggle" onclick="toggleDebugPanel()">Debug</button>
+            <button class="btn" onclick="toggleFullscreen()">Fullscreen</button>
+        </div>
+    </header>
+
+    <main>
+        <div id="video-section">
+            <div id="display-container">
+                <video id="display" autoplay playsinline muted></video>
+                <div class="overlay" id="overlay">
+                    <div class="overlay-content">
+                        <div class="spinner" id="spinner"></div>
+                        <h2 id="overlay-title">Connecting to Basilisk II</h2>
+                        <p id="overlay-status">Initializing...</p>
+
+                        <div class="connection-steps" id="connection-steps">
+                            <div class="step" id="step-ws">
+                                <span class="step-icon">1</span>
+                                <span>WebSocket signaling</span>
+                            </div>
+                            <div class="step" id="step-offer">
+                                <span class="step-icon">2</span>
+                                <span>Receiving offer</span>
+                            </div>
+                            <div class="step" id="step-ice">
+                                <span class="step-icon">3</span>
+                                <span>ICE negotiation</span>
+                            </div>
+                            <div class="step" id="step-track">
+                                <span class="step-icon">4</span>
+                                <span>Video track</span>
+                            </div>
+                            <div class="step" id="step-frames">
+                                <span class="step-icon">5</span>
+                                <span>Receiving frames</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="debug-panel">
+            <div class="debug-header">
+                <h3>Debug Console</h3>
+                <button class="clear-btn" onclick="clearLog()">Clear</button>
+            </div>
+            <div class="debug-tabs">
+                <div class="debug-tab active" onclick="showDebugTab('log')">Log</div>
+                <div class="debug-tab" onclick="showDebugTab('stats')">Stats</div>
+                <div class="debug-tab" onclick="showDebugTab('webrtc')">WebRTC</div>
+            </div>
+            <div class="debug-content">
+                <div class="debug-pane active" id="log-pane">
+                    <div id="debug-log"></div>
+                </div>
+                <div class="debug-pane" id="stats-pane">
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <div class="label">Video FPS</div>
+                            <div class="value" id="stat-fps">--</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="label">Bitrate</div>
+                            <div class="value" id="stat-bitrate">-- kbps</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="label">Resolution</div>
+                            <div class="value" id="stat-resolution">-- x --</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="label">Frames Decoded</div>
+                            <div class="value" id="stat-frames">0</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="label">Packets Lost</div>
+                            <div class="value" id="stat-packets-lost">0</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="label">Jitter</div>
+                            <div class="value" id="stat-jitter">-- ms</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="debug-pane" id="webrtc-pane">
+                    <div class="webrtc-section">
+                        <h4>Connection State</h4>
+                        <div class="webrtc-info">
+                            <div class="webrtc-state">
+                                <span class="key">WebSocket</span>
+                                <span class="value" id="ws-state">Closed</span>
+                            </div>
+                            <div class="webrtc-state">
+                                <span class="key">Peer Connection</span>
+                                <span class="value" id="pc-state">None</span>
+                            </div>
+                            <div class="webrtc-state">
+                                <span class="key">ICE Connection</span>
+                                <span class="value" id="ice-state">None</span>
+                            </div>
+                            <div class="webrtc-state">
+                                <span class="key">ICE Gathering</span>
+                                <span class="value" id="ice-gathering-state">None</span>
+                            </div>
+                            <div class="webrtc-state">
+                                <span class="key">Signaling</span>
+                                <span class="value" id="signaling-state">None</span>
+                            </div>
+                            <div class="webrtc-state">
+                                <span class="key">Data Channel</span>
+                                <span class="value" id="dc-state">None</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="webrtc-section">
+                        <h4>Video Track</h4>
+                        <div class="webrtc-info">
+                            <div class="webrtc-state">
+                                <span class="key">Track State</span>
+                                <span class="value" id="track-state">None</span>
+                            </div>
+                            <div class="webrtc-state">
+                                <span class="key">Track Enabled</span>
+                                <span class="value" id="track-enabled">--</span>
+                            </div>
+                            <div class="webrtc-state">
+                                <span class="key">Track Muted</span>
+                                <span class="value" id="track-muted">--</span>
+                            </div>
+                            <div class="webrtc-state">
+                                <span class="key">Video Size</span>
+                                <span class="value" id="video-size">-- x --</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="webrtc-section">
+                        <h4>SDP Info</h4>
+                        <div class="webrtc-info" style="max-height: 150px; overflow-y: auto;">
+                            <pre id="sdp-info" style="font-size: 10px; white-space: pre-wrap; word-break: break-all;">No SDP yet</pre>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <footer>
+        <span>Basilisk II WebRTC Streaming (libdatachannel)</span>
+        <span id="resolution">-- x --</span>
+    </footer>
+
+    <!-- Configuration Modal -->
+    <div class="modal-overlay" id="config-modal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2>Emulator Settings</h2>
+                <button class="modal-close" onclick="closeConfig()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>ROM File</label>
+                    <select id="cfg-rom" onchange="onRomChange()">
+                        <option value="">Loading...</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label>Disk Images</label>
+                    <div id="disk-list" class="disk-checkbox-list"><div class="empty-state">Loading...</div></div>
+                </div>
+
+                <div class="form-group">
+                    <label>RAM Size</label>
+                    <select id="cfg-ram">
+                        <option value="8">8 MB</option>
+                        <option value="16">16 MB</option>
+                        <option value="32" selected>32 MB</option>
+                        <option value="64">64 MB</option>
+                        <option value="128">128 MB</option>
+                        <option value="256">256 MB</option>
+                        <option value="512">512 MB</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label>Screen Resolution</label>
+                    <select id="cfg-screen">
+                        <option value="640x480">640 x 480</option>
+                        <option value="800x600" selected>800 x 600</option>
+                        <option value="1024x768">1024 x 768</option>
+                        <option value="1280x1024">1280 x 1024</option>
+                    </select>
+                </div>
+
+                <div class="advanced-toggle" onclick="toggleAdvanced()">
+                    <span class="arrow">&#9654;</span>
+                    <span>Advanced Settings</span>
+                </div>
+                <div class="advanced-content" id="advanced-settings">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>CPU Type</label>
+                            <select id="cfg-cpu">
+                                <option value="2">68020</option>
+                                <option value="3">68030</option>
+                                <option value="4" selected>68040</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>Mac Model</label>
+                            <select id="cfg-model">
+                                <option value="5">Mac II</option>
+                                <option value="14" selected>Quadra 900</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <div class="checkbox-group">
+                                <input type="checkbox" id="cfg-fpu" checked>
+                                <label for="cfg-fpu">Enable FPU (68881)</label>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <div class="checkbox-group">
+                                <input type="checkbox" id="cfg-jit" checked>
+                                <label for="cfg-jit">Enable JIT Compiler</label>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <div class="checkbox-group">
+                            <input type="checkbox" id="cfg-sound" checked>
+                            <label for="cfg-sound">Enable Sound</label>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="note-banner">
+                    Changes require emulator restart to take effect.
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" onclick="closeConfig()">Cancel</button>
+                <button class="btn success" onclick="saveConfig()">Save &amp; Restart</button>
+            </div>
+        </div>
     </div>
-    <div id="status">Initializing...</div>
-    <div class="info">libdatachannel backend - Click video to capture input</div>
+
+    <!-- Emulator Status Bar -->
+    <div class="emu-status" id="emu-status">
+        <span><span class="dot" id="dot-running"></span> Process</span>
+        <span><span class="dot" id="dot-connected"></span> IPC</span>
+        <span id="emu-pid">PID: -</span>
+    </div>
 
     <script src="datachannel_client.js"></script>
 </body>

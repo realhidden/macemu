@@ -1,4 +1,4 @@
-# Basilisk II Web Streaming Makefile
+# macemu WebRTC Streaming Server Makefile
 
 CXX = g++
 CXXFLAGS = -std=c++17 -Wall -Wextra -O2 -g -fPIC
@@ -15,41 +15,44 @@ LIBDATACHANNEL_BUILD = $(LIBDATACHANNEL_DIR)/build
 LIBDATACHANNEL_LIB = $(LIBDATACHANNEL_BUILD)/libdatachannel.a
 LIBDATACHANNEL_INCLUDES = -I$(LIBDATACHANNEL_DIR)/include
 
-# usrsctp library - needs symbol renaming to avoid conflicts with slirp
-USRSCTP_ORIG = $(LIBDATACHANNEL_BUILD)/deps/usrsctp/usrsctplib/libusrsctp.a
-USRSCTP_FIXED = $(LIBDATACHANNEL_BUILD)/deps/usrsctp/usrsctplib/libusrsctp_fixed.a
-
-# Symbols that conflict with slirp and need to be localized
-CONFLICTING_SYMBOLS = ip_defttl ip_id m_adj m_cat m_free m_get socreate sofree solisten
+# libdatachannel dependencies (built alongside libdatachannel)
+LIBJUICE = $(LIBDATACHANNEL_BUILD)/deps/libjuice/libjuice.a
+LIBSRTP = $(LIBDATACHANNEL_BUILD)/deps/libsrtp/libsrtp2.a
+USRSCTP = $(LIBDATACHANNEL_BUILD)/deps/usrsctp/usrsctplib/libusrsctp.a
 
 # libvpx (system package)
 VPX_CFLAGS = $(shell pkg-config --cflags vpx 2>/dev/null)
 VPX_LIBS = $(shell pkg-config --libs vpx 2>/dev/null || echo "-lvpx")
 
-# Combined flags for datachannel backend
-DATACHANNEL_CFLAGS = $(LIBDATACHANNEL_INCLUDES) $(VPX_CFLAGS)
-DATACHANNEL_LIBS = $(LIBDATACHANNEL_LIB) $(VPX_LIBS) -lpthread
+# OpenSSL (system package)
+OPENSSL_CFLAGS = $(shell pkg-config --cflags openssl 2>/dev/null)
+OPENSSL_LIBS = $(shell pkg-config --libs openssl 2>/dev/null || echo "-lssl -lcrypto")
 
-# Source files (libdatachannel-based streaming)
-DATACHANNEL_SRCS = $(SERVER_DIR)/datachannel_webrtc.cpp
+# Combined flags
+SERVER_CFLAGS = $(LIBDATACHANNEL_INCLUDES) $(VPX_CFLAGS) $(OPENSSL_CFLAGS)
+SERVER_LIBS = $(LIBDATACHANNEL_LIB) $(LIBJUICE) $(LIBSRTP) $(USRSCTP) $(VPX_LIBS) $(OPENSSL_LIBS) -lpthread -lrt
+
+# Source files
+SERVER_SRCS = $(SERVER_DIR)/standalone_server.cpp
 
 # Object files
-DATACHANNEL_OBJS = $(BUILD_DIR)/datachannel_webrtc.o
+SERVER_OBJS = $(BUILD_DIR)/standalone_server.o
 
-# Targets
-STATIC_LIB_DATACHANNEL = $(BUILD_DIR)/libdatachannelstreaming.a
-TEST_DATACHANNEL = $(BUILD_DIR)/test_datachannel
+# Target
+SERVER = $(BUILD_DIR)/macemu-webrtc
 
 # Default target
-all: deps-check libdatachannel dirs $(STATIC_LIB_DATACHANNEL)
+all: deps-check libdatachannel dirs $(SERVER)
 	@echo ""
 	@echo "Build complete!"
-	@echo "Static library: $(STATIC_LIB_DATACHANNEL)"
+	@echo "Server: $(SERVER)"
 	@echo ""
-	@echo "To use with Basilisk II:"
-	@echo "  cd ../BasiliskII/src/Unix"
-	@echo "  ./configure --enable-webstreaming"
-	@echo "  make"
+	@echo "Usage:"
+	@echo "  1. Start the server: ./$(SERVER)"
+	@echo "     (note the PID-based socket path it prints)"
+	@echo "  2. Build Basilisk II with: ./configure --enable-ipc-video && make"
+	@echo "  3. Run emulator: MACEMU_CONTROL_SOCK=/tmp/macemu-<PID>.sock ./BasiliskII"
+	@echo "  4. Open http://localhost:8000 in your browser"
 
 # Create build directory
 dirs:
@@ -73,37 +76,18 @@ $(LIBDATACHANNEL_LIB):
 		-DBUILD_SHARED_LIBS=OFF
 	$(MAKE) -C $(LIBDATACHANNEL_BUILD) -j$$(nproc)
 	@echo "libdatachannel built successfully"
-	@echo "Fixing usrsctp symbol conflicts with slirp..."
-	@cp $(USRSCTP_ORIG) $(USRSCTP_FIXED)
-	@for sym in $(CONFLICTING_SYMBOLS); do \
-		objcopy --redefine-sym $$sym=__usrsctp_$$sym $(USRSCTP_FIXED); \
-	done
-	@echo "Symbol conflicts fixed in $(USRSCTP_FIXED)"
 
-# Static library for libdatachannel version
-$(STATIC_LIB_DATACHANNEL): $(DATACHANNEL_OBJS)
-	ar rcs $@ $^
+# Compile server
+$(BUILD_DIR)/standalone_server.o: $(SERVER_DIR)/standalone_server.cpp $(SERVER_DIR)/ipc_protocol.h $(LIBDATACHANNEL_LIB)
+	$(CXX) $(CXXFLAGS) $(SERVER_CFLAGS) -c $< -o $@
 
-# Compile datachannel source
-$(BUILD_DIR)/datachannel_webrtc.o: $(SERVER_DIR)/datachannel_webrtc.cpp $(SERVER_DIR)/datachannel_webrtc.h $(LIBDATACHANNEL_LIB)
-	$(CXX) $(CXXFLAGS) $(DATACHANNEL_CFLAGS) -c $< -o $@
+# Link server
+$(SERVER): $(SERVER_OBJS)
+	$(CXX) -o $@ $(SERVER_OBJS) $(SERVER_LIBS)
 
-# Test harness for datachannel
-$(BUILD_DIR)/test_datachannel.o: $(SERVER_DIR)/test_datachannel.cpp $(SERVER_DIR)/datachannel_webrtc.h
-	$(CXX) $(CXXFLAGS) $(DATACHANNEL_CFLAGS) -c $< -o $@
-
-$(TEST_DATACHANNEL): $(DATACHANNEL_OBJS) $(BUILD_DIR)/test_datachannel.o
-	$(CXX) -o $@ $^ $(DATACHANNEL_LIBS)
-
-# Run test server
-run: $(TEST_DATACHANNEL)
-	./$(BUILD_DIR)/test_datachannel
-
-# Serve client files (requires Python)
-serve-client:
-	@echo "Starting HTTP server for client files on port 8000..."
-	@echo "Open http://localhost:8000/index_datachannel.html in your browser"
-	cd $(CLIENT_DIR) && python3 -m http.server 8000
+# Run server
+run: $(SERVER)
+	./$(SERVER)
 
 # Clean build files
 clean:
@@ -126,43 +110,37 @@ deps-check:
 deps:
 	sudo apt-get install -y cmake pkg-config libvpx-dev libssl-dev
 
-# Install library and headers for Basilisk II
-install: $(STATIC_LIB_DATACHANNEL) $(LIBDATACHANNEL_LIB)
-	@mkdir -p /usr/local/lib /usr/local/include/datachannel
-	cp $(STATIC_LIB_DATACHANNEL) /usr/local/lib/
-	cp $(LIBDATACHANNEL_LIB) /usr/local/lib/
-	cp -r $(LIBDATACHANNEL_DIR)/include/rtc /usr/local/include/
-	cp $(SERVER_DIR)/datachannel_webrtc.h /usr/local/include/datachannel/
+# Install server
+install: $(SERVER)
+	@mkdir -p /usr/local/bin
+	cp $(SERVER) /usr/local/bin/
 
 # Help
 help:
-	@echo "Basilisk II Web Streaming Build System (libdatachannel)"
+	@echo "macemu WebRTC Streaming Server"
 	@echo ""
 	@echo "Targets:"
-	@echo "  all          - Build everything (default)"
+	@echo "  all          - Build the server (default)"
 	@echo "  libdatachannel - Build libdatachannel library only"
-	@echo "  run          - Build and run test server"
-	@echo "  serve-client - Serve client files via HTTP on port 8000"
+	@echo "  run          - Build and run the server"
 	@echo "  clean        - Remove build files"
 	@echo "  distclean    - Remove all build files including libdatachannel"
 	@echo "  deps         - Install system dependencies"
 	@echo "  deps-check   - Check if dependencies are installed"
-	@echo "  install      - Install libraries to /usr/local"
+	@echo "  install      - Install server to /usr/local/bin"
 	@echo "  help         - Show this help"
 	@echo ""
 	@echo "Quick Start:"
 	@echo "  1. Install deps: make deps"
-	@echo "  2. Build: make"
-	@echo "  3. Build Basilisk II:"
+	@echo "  2. Build server: make"
+	@echo "  3. Run server: ./build/macemu-webrtc"
+	@echo "     Server prints: 'Control socket: /tmp/macemu-<PID>.sock'"
+	@echo "  4. Build Basilisk II:"
 	@echo "     cd ../BasiliskII/src/Unix"
-	@echo "     ./configure --enable-webstreaming"
+	@echo "     ./configure --enable-ipc-video"
 	@echo "     make"
-	@echo ""
-	@echo "For testing standalone:"
-	@echo "  1. make run          (in one terminal)"
-	@echo "  2. make serve-client (in another terminal)"
-	@echo "  3. Open http://localhost:8000/index_datachannel.html"
+	@echo "  5. Run emulator with socket path:"
+	@echo "     MACEMU_CONTROL_SOCK=/tmp/macemu-<PID>.sock ./BasiliskII"
+	@echo "  6. Open http://localhost:8000 in browser"
 
-test_datachannel: dirs libdatachannel $(TEST_DATACHANNEL)
-
-.PHONY: all dirs run serve-client clean distclean deps deps-check help libdatachannel test_datachannel install
+.PHONY: all dirs run clean distclean deps deps-check help libdatachannel install
