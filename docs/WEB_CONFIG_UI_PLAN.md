@@ -1,207 +1,245 @@
-# Web Configuration UI Plan
+# Web Configuration UI
 
-Add a browser-based configuration interface to the WebRTC streaming client.
+Browser-based configuration interface for the WebRTC streaming client.
 
-## Overview
+## Implementation Status
 
-Allow users to configure Basilisk II settings via the web UI, with changes saved to a prefs file that takes effect on restart.
+### Completed
+- ✅ Settings modal with ROM/disk/RAM/screen selection
+- ✅ ROM dropdown with known ROM database and checksums
+- ✅ Disk image checkboxes for multi-select
+- ✅ Auto-set Mac model based on ROM selection
+- ✅ GET /api/config - read current configuration
+- ✅ POST /api/config - save configuration
+- ✅ GET /api/storage - list available ROMs and disks
+- ✅ Full prefs file generation with all options
+- ✅ Emulator start/stop/restart controls
+- ✅ Connection status display
+- ✅ WebRTC state debugging panel
 
-## Storage Directory
-
-A configurable storage directory (default: `./storage/` relative to executable, or `BASILISK_STORAGE` env var) contains:
-- ROM files (`*.rom`, `*.ROM`)
-- Disk images (`*.img`, `*.dsk`, `*.hfv`, `*.iso`)
-
-The server scans this directory and provides lists to the UI via API.
+### Pending
+- ⬜ ROM file upload
+- ⬜ Disk image upload
+- ⬜ Network configuration (SLiRP, etc.)
+- ⬜ Shared folder (ExtFS) configuration
 
 ## API Endpoints
 
 ### GET /api/config
-Returns current configuration as JSON:
-```json
-{
-  "rom": "Quadra700.ROM",
-  "disks": ["System7.img", "Apps.img"],
-  "ramsize": 16,
-  "screen": {"width": 800, "height": 600},
-  "cpu": 4,
-  "fpu": true,
-  "modelid": 14,
-  "jit": true,
-  "sound": true,
-  "frameskip": 2
-}
-```
 
-### GET /api/storage
-Returns available files in storage directory:
+Returns current configuration:
 ```json
 {
-  "roms": ["Quadra700.ROM", "Performa.ROM"],
-  "disks": ["System7.img", "Apps.img", "Games.iso"],
-  "path": "/home/user/storage"
+  "rom": "1991-10 - 420DBFF3 - Quadra 700.ROM",
+  "disks": ["7.6.img", "Apps.img"],
+  "ram": 32,
+  "screen": "800x600",
+  "cpu": 4,
+  "model": 14,
+  "fpu": true,
+  "jit": true,
+  "sound": true
 }
 ```
 
 ### POST /api/config
-Saves configuration. Body is same format as GET response.
-Returns: `{"success": true}` or `{"error": "message"}`
 
-Note: Changes require emulator restart to take effect.
+Save configuration (same format as GET response).
 
-## Settings to Support
+Returns: `{"success": true}` or `{"success": false, "error": "message"}`
 
-### Essential
+### GET /api/storage
 
-| Setting | Pref Key | UI Element | Values |
-|---------|----------|------------|--------|
-| ROM | `rom` | Dropdown | Scanned from storage/*.rom |
-| Disk Images | `disk` | Multi-select list | Scanned from storage/*.img |
-| RAM Size | `ramsize` | Dropdown | 8, 16, 32, 64, 128, 256, 512 MB |
-| Resolution | `screen` | Dropdown | 640x480, 800x600, 1024x768, 1280x1024 |
+Returns available files:
+```json
+{
+  "roms": [
+    {"name": "Quadra700.ROM", "size": 1048576, "checksum": "420dbff3"}
+  ],
+  "disks": [
+    {"name": "System7.img", "size": 104857600}
+  ]
+}
+```
 
-### Advanced (collapsible)
+### GET /api/status
 
-| Setting | Pref Key | UI Element | Values |
-|---------|----------|------------|--------|
-| CPU Type | `cpu` | Dropdown | 68020, 68030, 68040 |
-| FPU | `fpu` | Checkbox | Enable 68881 FPU |
-| Mac Model | `modelid` | Dropdown | 5=Mac II, 14=Quadra 900, etc. |
+Returns emulator status:
+```json
+{
+  "emulator_connected": true,
+  "emulator_running": true,
+  "emulator_pid": 12345,
+  "video": {"width": 800, "height": 600, "frame_count": 1000}
+}
+```
+
+### POST /api/emulator/start
+### POST /api/emulator/stop
+### POST /api/emulator/restart
+
+Emulator lifecycle control.
+
+## Configuration Options
+
+### Basic Settings
+
+| Setting | API Key | UI Element | Values |
+|---------|---------|------------|--------|
+| ROM | `rom` | Dropdown | From /api/storage |
+| Disk Images | `disks` | Checkboxes | From /api/storage |
+| RAM Size | `ram` | Dropdown | 8, 16, 32, 64, 128 MB |
+| Resolution | `screen` | Dropdown | 640x480, 800x600, 1024x768 |
+
+### Advanced Settings
+
+| Setting | API Key | UI Element | Values |
+|---------|---------|------------|--------|
+| CPU Type | `cpu` | Dropdown | 2=68020, 3=68030, 4=68040 |
+| Mac Model | `model` | Dropdown | Auto-set from ROM |
+| FPU | `fpu` | Checkbox | Enable 68881/68882 FPU |
 | JIT | `jit` | Checkbox | Enable JIT compiler |
-| Sound | `nosound` | Checkbox (inverted) | Enable sound |
-| Frame Skip | `frameskip` | Dropdown | 0, 1, 2, 4, 8 |
+| Sound | `sound` | Checkbox | Enable audio |
 
-## UI Design
+## Known ROM Database
+
+The client includes a database of known Mac ROMs with checksums:
+
+| Checksum | Model | Recommended |
+|----------|-------|-------------|
+| 97851db6 | Mac II | No |
+| 368cadfe | Mac IIci | Yes |
+| 420dbff3 | Quadra 700 | Yes |
+| 3dc27823 | Quadra 900 | Yes |
+| e33b2724 | Quadra 950 | Yes |
+| ecfa989b | Quadra 800 | Yes |
+| a49f9914 | Quadra 660AV | No |
+| 9feb69b3 | Quadra 840AV | No |
+
+When a known ROM is selected, the Mac model is automatically set to match.
+
+## UI Layout
 
 ```
-+------------------------------------------+
-|  [Basilisk II]              [Settings]   |
-+------------------------------------------+
-|                                          |
-|                                          |
-|           <video stream>                 |
-|                                          |
-|                                          |
-+------------------------------------------+
-|  Status: Connected | FPS: 30 | Peers: 1  |
-+------------------------------------------+
+┌─────────────────────────────────────────────────────────────┐
+│  🖥 Basilisk II Web  [libdatachannel]   ● Connected   ⚙️    │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│                      <video stream>                         │
+│                                                             │
+├─────────────────────────────────────────────────────────────┤
+│  Emulator: ▶ Start  ⏹ Stop  🔄 Restart                      │
+├─────────────────────────────────────────────────────────────┤
+│  WebRTC State  │  Log Messages                              │
+│  WS: open      │  [timestamp] Connected to server           │
+│  PC: connected │  [timestamp] Video stream started          │
+│  ICE: complete │                                            │
+└─────────────────────────────────────────────────────────────┘
 
-Settings Panel (slide-in from right or modal):
-+------------------------------------------+
-|  Settings                           [X]  |
-+------------------------------------------+
-|                                          |
-|  ROM File                                |
-|  [Quadra700.ROM                    ▼]   |
-|                                          |
-|  Disk Images                             |
-|  [✓] System7.img                         |
-|  [ ] Apps.img                            |
-|  [ ] Games.iso                           |
-|                                          |
-|  RAM Size                                |
-|  [16 MB                            ▼]   |
-|                                          |
-|  Resolution                              |
-|  [800 x 600                        ▼]   |
-|                                          |
-|  ▶ Advanced Settings                     |
-|  +--------------------------------------+|
-|  | CPU: [68040 ▼]  FPU: [✓]            ||
-|  | Model: [Quadra 900 ▼]               ||
-|  | JIT: [✓]  Sound: [✓]                ||
-|  +--------------------------------------+|
-|                                          |
-|  [Save & Restart]                        |
-|                                          |
-|  Note: Changes require restart           |
-+------------------------------------------+
+Settings Modal:
+┌─────────────────────────────────────────────────────────────┐
+│  Settings                                              [X]  │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  ROM File                                                   │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ Quadra 700 (420DBFF3) - Recommended              ▼ │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  Disk Images                                                │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ ☑ 7.6.img (500 MB)                                  │   │
+│  │ ☐ Apps.img (100 MB)                                 │   │
+│  │ ☐ Games.img (200 MB)                                │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  RAM: [32 MB ▼]    Screen: [800x600 ▼]                     │
+│                                                             │
+│  ▶ Advanced Settings                                        │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ CPU: [68040 ▼]  Model: [Quadra 900 ▼]              │   │
+│  │ ☑ FPU   ☑ JIT   ☑ Sound                            │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│                              [Cancel]  [Save & Restart]     │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-## Implementation
+## Prefs File Format
 
-### Backend Changes (datachannel_webrtc.cpp)
+Generated prefs file includes all standard Basilisk II options:
 
-1. Add storage directory scanning:
-```cpp
-std::vector<std::string> scan_storage_files(const char* extension);
-std::string get_storage_path();
 ```
+# Basilisk II preferences - generated by web UI
 
-2. Add config read/write:
-```cpp
-std::string read_config_json();
-bool write_config_from_json(const std::string& json);
-```
+rom /path/to/storage/roms/Quadra700.ROM
+disk /path/to/storage/images/7.6.img
 
-3. Add HTTP route handling in `handle_http_request()`:
-```cpp
-if (path == "/api/config" && method == "GET") { ... }
-if (path == "/api/config" && method == "POST") { ... }
-if (path == "/api/storage" && method == "GET") { ... }
-```
-
-4. Prefs file location:
-- Default: `~/.basilisk_ii_prefs` or `basilisk_ii_prefs` in current dir
-- Can be overridden with `BASILISK_PREFS` env var
-
-### Frontend Changes (embedded HTML/JS)
-
-1. Add settings button to header
-2. Add settings panel/modal HTML
-3. Add JavaScript:
-   - `loadConfig()` - GET /api/config
-   - `loadStorage()` - GET /api/storage
-   - `saveConfig()` - POST /api/config
-   - UI event handlers for form elements
-
-### File Format
-
-Standard Basilisk II prefs format:
-```
-rom /path/to/storage/Quadra700.ROM
-disk /path/to/storage/System7.img
-disk /path/to/storage/Apps.img
-ramsize 16777216
-screen win/800/600
+# Hardware settings
+ramsize 33554432
+screen ipc/800/600
 cpu 4
-fpu true
 modelid 14
+fpu true
 jit true
 nosound false
-frameskip 2
+
+# JIT settings
+jitfpu true
+jitcachesize 8192
+jitlazyflush true
+jitinline true
+jitdebug false
+
+# Display settings
+displaycolordepth 0
+frameskip 0
+scale_nearest false
+scale_integer false
+
+# Input settings
+keyboardtype 5
+keycodes false
+mousewheelmode 1
+mousewheellines 3
+swap_opt_cmd true
+hotkey 0
+
+# Serial/Network
+seriala /dev/null
+serialb /dev/null
+udptunnel false
+udpport 6066
+
+# Boot settings
+bootdrive 0
+bootdriver 0
+nocdrom false
+
+# System settings
+ignoresegv true
+idlewait true
+noclipconversion false
+nogui true
+
+# SDL settings
+sdlrender software
+sdl_vsync true
+
+# ExtFS settings
+enableextfs false
+extfs
 ```
 
-## Mac Model IDs
+## Reverse Proxy Support
 
-| ID | Model |
-|----|-------|
-| 5 | Mac II |
-| 6 | Mac IIx |
-| 7 | Mac IIcx |
-| 11 | Mac IIci |
-| 13 | Mac IIfx |
-| 14 | Quadra 900 |
-| 18 | Quadra 700 |
+The client supports running behind a reverse proxy:
 
-## Milestones
+1. **Relative API paths**: All API calls use relative URLs
+2. **WebSocket URL override**: Use `?ws=wss://host/path` or `<meta name="ws-url">`
+3. **HTTPS support**: Automatically uses `wss://` for secure connections
 
-### Phase 1: Backend API
-- [ ] Add storage directory scanning
-- [ ] Add GET /api/config endpoint
-- [ ] Add GET /api/storage endpoint
-- [ ] Add POST /api/config endpoint
-- [ ] Write prefs file in standard format
-
-### Phase 2: Frontend UI
-- [ ] Add settings button
-- [ ] Add settings panel HTML
-- [ ] Populate dropdowns from /api/storage
-- [ ] Load current config on open
-- [ ] Save config and show restart message
-
-### Phase 3: Polish
-- [ ] Add validation (ROM required, etc.)
-- [ ] Add error handling/display
-- [ ] Style improvements
-- [ ] Test across browsers
+Example for VS Code port forwarding:
+```
+https://dev.example.com/proxy/8000/?ws=wss://dev.example.com/proxy/8090/
+```

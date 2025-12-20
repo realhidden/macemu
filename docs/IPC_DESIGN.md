@@ -1,12 +1,12 @@
-# IPC Design for Standalone WebRTC Server
+# IPC Design for Web Streaming
 
-Design for moving the WebRTC server to a standalone process that communicates with BasiliskII/SheepShaver via IPC.
+Architecture for the standalone WebRTC server that communicates with BasiliskII/SheepShaver via IPC.
 
 ## Overview
 
 ```
 ┌─────────────────┐         IPC          ┌─────────────────┐
-│   BasiliskII    │◄───────────────────►│  macemu-webrtc  │
+│   BasiliskII    │◄───────────────────►│  standalone     │
 │  or SheepShaver │                      │     server      │
 └─────────────────┘                      └─────────────────┘
         │                                        │
@@ -14,88 +14,79 @@ Design for moving the WebRTC server to a standalone process that communicates wi
    Mac OS Guest                            Web Browsers
 ```
 
+## Implementation Status
+
+- ✅ Shared memory for video frames (triple-buffered)
+- ✅ Shared memory for audio (ring buffer)
+- ✅ Unix domain socket for input/control
+- ✅ Standalone WebRTC server
+- ✅ IPC video driver for emulator
+- ✅ Web configuration UI
+
 ## IPC Mechanisms
 
 ### Video Frames: POSIX Shared Memory
 
-**Why**: Video is high-bandwidth (~57 MB/s at 800×600×4×30fps). Shared memory provides zero-copy transfer.
+**Location**: `/dev/shm/macemu-video-{pid}`
 
-**Location**: `/dev/shm/macemu-video`
+High-bandwidth video (~57 MB/s at 800×600×4×30fps) uses shared memory for zero-copy transfer.
 
 ```cpp
-struct SharedVideoBuffer {
-    uint32_t magic;                     // 0x4D454D55 "MEMU"
-    uint32_t version;                   // Protocol version (1)
-    uint32_t width;                     // Frame width in pixels
-    uint32_t height;                    // Frame height in pixels
-    uint32_t stride;                    // Bytes per row
-    std::atomic<uint32_t> write_index;  // Current write buffer (0-2)
-    std::atomic<uint32_t> read_index;   // Last read buffer
-    std::atomic<uint64_t> frame_count;  // Total frames written
-    std::atomic<uint64_t> timestamp_us; // Timestamp of current frame
-    uint8_t frames[3][MAX_FRAME_SIZE];  // Triple buffer (RGBA)
+struct MacEmuVideoBuffer {
+    uint32_t magic;           // MACEMU_VIDEO_MAGIC
+    uint32_t version;         // MACEMU_IPC_VERSION (1)
+    uint32_t width;           // Frame width
+    uint32_t height;          // Frame height
+    uint32_t stride;          // Bytes per row (width * 4)
+    uint32_t format;          // 0 = RGBA
+    std::atomic<uint32_t> write_index;   // Triple buffer index (0-2)
+    std::atomic<uint64_t> frame_count;   // Total frames written
+    uint8_t frames[3][MAX_FRAME_SIZE];   // Triple-buffered RGBA
 };
 ```
 
-**Triple Buffering**:
-- Emulator writes to `(write_index + 1) % 3`
-- After write complete, atomically updates `write_index`
-- Server reads from `write_index` (never the one being written)
-- No locks needed, no tearing, no blocking
+**Triple Buffering Protocol**:
+1. Emulator writes to `(write_index + 1) % 3`
+2. After write, atomically updates `write_index`
+3. Server reads from `write_index`
+4. Lock-free, no tearing, no blocking
 
 ### Audio: Shared Memory Ring Buffer
 
-**Why**: Audio is medium-bandwidth (~176 KB/s) but latency-sensitive.
-
-**Location**: `/dev/shm/macemu-audio`
+**Location**: `/dev/shm/macemu-audio-{pid}`
 
 ```cpp
-struct SharedAudioBuffer {
-    uint32_t magic;                     // 0x4D415544 "MAUD"
-    uint32_t version;                   // Protocol version (1)
-    uint32_t sample_rate;               // e.g., 44100
-    uint32_t channels;                  // 1 or 2
-    uint32_t format;                    // 0=S16LE, 1=F32LE
-    uint32_t buffer_size;               // Ring buffer size in bytes
-    std::atomic<uint32_t> write_pos;    // Write position
-    std::atomic<uint32_t> read_pos;     // Read position
-    uint8_t ring_buffer[65536];         // 64KB ring buffer (~370ms at 44.1kHz stereo)
+struct MacEmuAudioBuffer {
+    uint32_t magic;           // MACEMU_AUDIO_MAGIC
+    uint32_t version;         // MACEMU_IPC_VERSION
+    uint32_t sample_rate;     // e.g., 44100
+    uint32_t channels;        // 1 or 2
+    uint32_t format;          // 0=S16LE
+    uint32_t buffer_size;     // Ring buffer size
+    std::atomic<uint32_t> write_pos;
+    std::atomic<uint32_t> read_pos;
+    uint8_t ring_buffer[65536];
 };
 ```
 
-**Ring Buffer Protocol**:
-- Emulator writes samples, advances `write_pos`
-- Server reads samples, advances `read_pos`
-- Available data: `(write_pos - read_pos) % buffer_size`
-- Lock-free with memory barriers
-
 ### Input/Control: Unix Domain Socket
 
-**Why**: Input is low-bandwidth, bidirectional, and event-driven.
+**Location**: `/tmp/macemu-{pid}.sock`
 
-**Location**: `/tmp/macemu-control.sock`
+Bidirectional JSON messages over Unix socket.
 
-**Protocol**: Newline-delimited JSON messages
-
-#### Server → Emulator (Input Events)
+#### Server → Emulator
 
 ```json
-{"type": "mouse_move", "x": 100, "y": 200}
-{"type": "mouse_button", "x": 100, "y": 200, "button": 0, "pressed": true}
-{"type": "key", "code": 65, "pressed": true, "ctrl": false, "alt": false, "shift": false, "meta": false}
-{"type": "get_config"}
-{"type": "set_config", "config": {"rom": "Quadra.ROM", "ramsize": 16, ...}}
+{"type": "mouse", "x": 100, "y": 200, "buttons": 1}
+{"type": "key", "code": 65, "down": true}
 {"type": "restart"}
-{"type": "shutdown"}
 ```
 
-#### Emulator → Server (Responses)
+#### Emulator → Server
 
 ```json
-{"type": "config", "data": {"rom": "Quadra.ROM", "ramsize": 16, ...}}
-{"type": "storage", "roms": ["Quadra.ROM"], "disks": ["System7.img"]}
-{"type": "status", "running": true, "fps": 30}
-{"type": "error", "message": "Failed to save config"}
+{"type": "resolution", "width": 800, "height": 600}
 {"type": "ack"}
 ```
 
@@ -103,174 +94,107 @@ struct SharedAudioBuffer {
 
 ```
 web-streaming/
-├── libdatachannel/           # WebRTC library (submodule)
 ├── server/
-│   ├── datachannel_webrtc.cpp  # Current monolithic implementation
-│   ├── datachannel_webrtc.h
-│   ├── ipc_protocol.h          # NEW: Shared memory structures
-│   ├── standalone_server.cpp   # NEW: Standalone WebRTC server
-│   └── main.cpp                # NEW: Server entry point
+│   ├── standalone_server.cpp   # Main server (WebRTC, HTTP, IPC)
+│   └── ipc_protocol.h          # Shared memory structures
 ├── client/
-│   └── ...                     # Unchanged
+│   ├── index_datachannel.html  # Web UI
+│   ├── datachannel_client.js   # WebRTC client
+│   └── styles.css              # Styling
+├── storage/
+│   ├── roms/                   # ROM files
+│   └── images/                 # Disk images
 └── Makefile
 
-BasiliskII/src/SDL/
-├── video_sdl2.cpp              # SDL video driver
-├── video_headless.cpp          # Current headless driver
-└── video_ipc.cpp               # NEW: IPC video driver
+BasiliskII/src/IPC/
+└── video_ipc.cpp               # IPC video driver
 ```
 
-## Emulator-Side Implementation
+## Building
 
-### video_ipc.cpp
+### Server
 
-```cpp
-// Shared memory setup
-static SharedVideoBuffer* g_video_shm = nullptr;
-static SharedAudioBuffer* g_audio_shm = nullptr;
-static int g_control_socket = -1;
-
-bool VideoIPC_Init(int width, int height) {
-    // Create/open shared memory for video
-    int fd = shm_open("/macemu-video", O_CREAT | O_RDWR, 0666);
-    ftruncate(fd, sizeof(SharedVideoBuffer));
-    g_video_shm = mmap(...);
-
-    // Initialize header
-    g_video_shm->magic = 0x4D454D55;
-    g_video_shm->version = 1;
-    g_video_shm->width = width;
-    g_video_shm->height = height;
-    g_video_shm->stride = width * 4;
-
-    // Connect to control socket
-    g_control_socket = socket(AF_UNIX, SOCK_STREAM, 0);
-    connect(g_control_socket, "/tmp/macemu-control.sock");
-
-    // Start input listener thread
-    pthread_create(&input_thread, nullptr, input_listener, nullptr);
-
-    return true;
-}
-
-void VideoIPC_PushFrame(const uint8_t* rgba, int width, int height) {
-    uint32_t next = (g_video_shm->write_index.load() + 1) % 3;
-    memcpy(g_video_shm->frames[next], rgba, width * height * 4);
-    g_video_shm->frame_count++;
-    g_video_shm->timestamp_us = get_timestamp_us();
-    g_video_shm->write_index.store(next);
-}
+```bash
+cd web-streaming
+make
 ```
 
-## Server-Side Implementation
+Dependencies: libdatachannel, libvpx
 
-### standalone_server.cpp
+### Emulator with IPC
 
-```cpp
-class StandaloneServer {
-    SharedVideoBuffer* video_shm;
-    SharedAudioBuffer* audio_shm;
-    int control_listen_socket;
-    int control_client_socket;
-
-    // WebRTC components (from existing datachannel_webrtc.cpp)
-    rtc::WebSocket* signaling_ws;
-    std::map<std::string, std::shared_ptr<Peer>> peers;
-    VpxEncoder encoder;
-
-public:
-    void run() {
-        // Open shared memory (read-only for video/audio)
-        open_shared_memory();
-
-        // Create control socket (server)
-        create_control_socket();
-
-        // Start HTTP server for client files
-        start_http_server();
-
-        // Main loop
-        while (running) {
-            // Check for new video frame
-            if (video_shm->write_index != last_frame) {
-                encode_and_send_frame();
-            }
-
-            // Check for audio data
-            if (audio_available()) {
-                encode_and_send_audio();
-            }
-
-            // Process WebRTC events
-            process_webrtc();
-
-            // Forward input to emulator via control socket
-            process_input_events();
-        }
-    }
-};
+```bash
+cd BasiliskII/src/Unix
+./configure --enable-ipc-video
+make
 ```
 
-## Startup Sequence
+## Running
 
-1. **Server starts first** (or in parallel):
-   ```bash
-   macemu-webrtc --port 8000 --signaling-port 8090
-   ```
-   - Creates shared memory segments
-   - Creates control socket (listens)
-   - Starts HTTP server
-   - Waits for emulator connection
+### Option 1: Server manages emulator (recommended)
 
-2. **Emulator starts**:
-   ```bash
-   BasiliskII --ipc-video
-   ```
-   - Opens shared memory (created by server)
-   - Connects to control socket
-   - Starts sending frames
+```bash
+cd web-streaming
+./server/standalone_server --emulator ../BasiliskII/src/Unix/BasiliskII
+```
 
-3. **Browser connects**:
-   - HTTP request → client files
-   - WebSocket → signaling
-   - WebRTC → video stream
+Server auto-starts emulator, manages lifecycle, restarts on crash.
+
+### Option 2: Manual startup
+
+Terminal 1:
+```bash
+./server/standalone_server --no-auto-start
+```
+
+Terminal 2:
+```bash
+MACEMU_VIDEO_SHM=/macemu-video-{pid} \
+MACEMU_CONTROL_SOCK=/tmp/macemu-{pid}.sock \
+./BasiliskII --config prefs
+```
+
+## Command Line Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-p, --http-port` | 8000 | HTTP server port |
+| `-s, --signaling` | 8090 | WebSocket signaling port |
+| `-e, --emulator` | auto | Path to emulator executable |
+| `-P, --prefs` | basilisk_ii.prefs | Prefs file path |
+| `-n, --no-auto-start` | false | Don't auto-start emulator |
+| `--roms` | storage/roms | ROM directory |
+| `--images` | storage/images | Disk images directory |
 
 ## Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MACEMU_VIDEO_SHM` | `/macemu-video` | Shared memory name for video |
-| `MACEMU_AUDIO_SHM` | `/macemu-audio` | Shared memory name for audio |
-| `MACEMU_CONTROL_SOCK` | `/tmp/macemu-control.sock` | Control socket path |
-| `BASILISK_ROMS` | `./storage/roms` | ROM directory |
-| `BASILISK_IMAGES` | `./storage/images` | Disk image directory |
+| Variable | Description |
+|----------|-------------|
+| `MACEMU_VIDEO_SHM` | Override video shared memory name |
+| `MACEMU_CONTROL_SOCK` | Override control socket path |
+| `BASILISK_ROMS` | ROM directory |
+| `BASILISK_IMAGES` | Disk images directory |
+
+## Video Pipeline
+
+```
+┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+│ Emulator │───►│ Shared   │───►│ VP8      │───►│ WebRTC   │
+│ (RGBA)   │    │ Memory   │    │ Encoder  │    │ RTP/UDP  │
+└──────────┘    └──────────┘    └──────────┘    └──────────┘
+                     │
+              Zero-copy transfer
+```
+
+1. Emulator writes RGBA frame to shared memory
+2. Server reads frame, converts RGBA → I420
+3. VP8 encoder compresses frame
+4. RTP packetizer sends over WebRTC data channel
 
 ## Benefits
 
-1. **Process isolation**: WebRTC server can restart without affecting emulator
+1. **Process isolation**: Server can restart without affecting emulator
 2. **Shared codebase**: Same server works with BasiliskII and SheepShaver
-3. **Resource management**: Server handles encoding load separately
-4. **Debugging**: Can run emulator with different video drivers
-5. **Testing**: Can test server with synthetic frame generator
-
-## Migration Path
-
-### Phase 1: Add IPC Protocol Header
-- Create `ipc_protocol.h` with shared structures
-- No functional changes yet
-
-### Phase 2: Create video_ipc.cpp
-- New video driver that writes to shared memory
-- Control socket client for input
-- Test with existing embedded server
-
-### Phase 3: Create Standalone Server
-- Extract WebRTC/encoding from datachannel_webrtc.cpp
-- Add shared memory reader
-- Add control socket server
-- Build as separate executable
-
-### Phase 4: Integration
-- Add configure option `--enable-ipc-video`
-- Update build system
-- Documentation
+3. **Resource management**: Encoding load is separate from emulation
+4. **Zero-copy video**: Shared memory eliminates frame copies
+5. **Flexible deployment**: Emulator and server can run on different hosts (with network transport)
