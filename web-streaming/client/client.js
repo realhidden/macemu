@@ -757,6 +757,11 @@ class BasiliskWebRTC {
                     const bytesReceived = report.bytesReceived || 0;
                     const framesDecoded = report.framesDecoded || 0;
                     const packetsLost = report.packetsLost || 0;
+                    const packetsReceived = report.packetsReceived || 0;
+                    const framesDropped = report.framesDropped || 0;
+                    const framesReceived = report.framesReceived || 0;
+                    const keyFramesDecoded = report.keyFramesDecoded || 0;
+                    const totalDecodeTime = report.totalDecodeTime || 0;
                     const jitter = report.jitter || 0;
 
                     if (elapsed > 0) {
@@ -767,7 +772,26 @@ class BasiliskWebRTC {
 
                     this.stats.framesDecoded = framesDecoded;
                     this.stats.packetsLost = packetsLost;
+                    this.stats.packetsReceived = packetsReceived;
+                    this.stats.framesDropped = framesDropped;
+                    this.stats.framesReceived = framesReceived;
+                    this.stats.keyFramesDecoded = keyFramesDecoded;
                     this.stats.jitter = Math.round(jitter * 1000);
+
+                    // Log detailed stats every 3 seconds
+                    if (!this.lastDetailedStatsTime || (now - this.lastDetailedStatsTime) > 3000) {
+                        logger.info('RTP stats', {
+                            packetsRecv: packetsReceived,
+                            packetsLost: packetsLost,
+                            bytesRecv: bytesReceived,
+                            framesRecv: framesReceived,
+                            framesDecoded: framesDecoded,
+                            framesDropped: framesDropped,
+                            keyFrames: keyFramesDecoded,
+                            decodeTime: totalDecodeTime.toFixed(2) + 's'
+                        });
+                        this.lastDetailedStatsTime = now;
+                    }
 
                     this.lastBytesReceived = bytesReceived;
                     this.lastFramesDecoded = framesDecoded;
@@ -954,9 +978,94 @@ function getWebSocketUrl() {
     return `${protocol}//${hostname}:8090/`;
 }
 
+// Log browser and codec capabilities
+async function logBrowserCapabilities() {
+    // Browser info
+    const ua = navigator.userAgent;
+    const browserMatch = ua.match(/(Firefox|Chrome|Safari|Edge|OPR)\/(\d+)/);
+    const browser = browserMatch ? `${browserMatch[1]} ${browserMatch[2]}` : 'Unknown';
+
+    logger.info('Browser', {
+        name: browser,
+        userAgent: ua.substring(0, 100) + (ua.length > 100 ? '...' : '')
+    });
+
+    // Check H.264 decode support via MediaCapabilities API
+    if ('mediaCapabilities' in navigator) {
+        try {
+            // Test H.264 Constrained Baseline Level 5.1 (what server sends)
+            const h264Config = {
+                type: 'file',
+                video: {
+                    contentType: 'video/mp4; codecs="avc1.42e033"',  // CBP Level 5.1
+                    width: 1920,
+                    height: 1080,
+                    framerate: 30,
+                    bitrate: 40000000  // 40 Mbps
+                }
+            };
+            const h264Result = await navigator.mediaCapabilities.decodingInfo(h264Config);
+            logger.info('H.264 CBP L5.1 decode', {
+                supported: h264Result.supported,
+                smooth: h264Result.smooth,
+                powerEfficient: h264Result.powerEfficient
+            });
+
+            // Also test Level 3.1 for comparison
+            const h264L31Config = {
+                type: 'file',
+                video: {
+                    contentType: 'video/mp4; codecs="avc1.42e01f"',  // CBP Level 3.1
+                    width: 1280,
+                    height: 720,
+                    framerate: 30,
+                    bitrate: 10000000
+                }
+            };
+            const h264L31Result = await navigator.mediaCapabilities.decodingInfo(h264L31Config);
+            logger.info('H.264 CBP L3.1 decode', {
+                supported: h264L31Result.supported,
+                smooth: h264L31Result.smooth,
+                powerEfficient: h264L31Result.powerEfficient
+            });
+        } catch (e) {
+            logger.warn('MediaCapabilities check failed', { error: e.message });
+        }
+    } else {
+        logger.warn('MediaCapabilities API not available');
+    }
+
+    // Check RTCRtpReceiver capabilities
+    if (RTCRtpReceiver.getCapabilities) {
+        const videoCaps = RTCRtpReceiver.getCapabilities('video');
+        if (videoCaps) {
+            const h264Codecs = videoCaps.codecs.filter(c => c.mimeType.includes('H264') || c.mimeType.includes('h264'));
+            logger.info('WebRTC H.264 codecs', {
+                count: h264Codecs.length,
+                profiles: h264Codecs.map(c => c.sdpFmtpLine || 'default').join('; ')
+            });
+        }
+    }
+
+    // Hardware acceleration check (Chrome-specific)
+    if ('gpu' in navigator) {
+        try {
+            const adapter = await navigator.gpu?.requestAdapter();
+            if (adapter) {
+                logger.info('WebGPU available', { name: adapter.name || 'unknown' });
+            }
+        } catch (e) {
+            // WebGPU not available
+        }
+    }
+}
+
 function initClient() {
     logger.init();
     logger.info('Basilisk II WebRTC Client initialized');
+
+    // Log browser capabilities asynchronously
+    logBrowserCapabilities().catch(e => logger.warn('Capability check failed', { error: e.message }));
 
     const video = document.getElementById('display');
     if (!video) {

@@ -683,54 +683,6 @@ private:
 
 
 /*
- * Simple 3x3 box blur for Y plane to reduce dithering noise
- * This helps H.264 compress 1-bit dithered Mac screens much better
- */
-
-class YPlaneBlur {
-public:
-    // Blur Y plane in-place or to destination buffer
-    // IMPORTANT: stride is used for row indexing, width for iteration bounds
-    void blur(const uint8_t* src, uint8_t* dst, int width, int height, int stride) {
-        // For edges, just copy. For interior, apply 3x3 average.
-        for (int row = 0; row < height; row++) {
-            for (int col = 0; col < width; col++) {
-                if (row == 0 || row == height - 1 || col == 0 || col == width - 1) {
-                    // Edge pixel - just copy
-                    dst[row * stride + col] = src[row * stride + col];
-                } else {
-                    // Interior pixel - 3x3 average using stride for row offsets
-                    int sum = 0;
-                    sum += src[(row-1) * stride + (col-1)];
-                    sum += src[(row-1) * stride + col];
-                    sum += src[(row-1) * stride + (col+1)];
-                    sum += src[row * stride + (col-1)];
-                    sum += src[row * stride + col];
-                    sum += src[row * stride + (col+1)];
-                    sum += src[(row+1) * stride + (col-1)];
-                    sum += src[(row+1) * stride + col];
-                    sum += src[(row+1) * stride + (col+1)];
-                    dst[row * stride + col] = (uint8_t)(sum / 9);
-                }
-            }
-        }
-    }
-
-    // Allocate buffer sized to match stride*height (not width*height)
-    uint8_t* get_buffer(int stride, int height) {
-        size_t size = (size_t)stride * height;
-        if (buffer_.size() < size) {
-            buffer_.resize(size);
-        }
-        return buffer_.data();
-    }
-
-private:
-    std::vector<uint8_t> buffer_;
-};
-
-
-/*
  * H.264 Encoder using OpenH264 - reads I420 directly from SHM
  */
 
@@ -762,7 +714,7 @@ public:
         param.iSpatialLayerNum = 1;
         param.iTemporalLayerNum = 1;
         param.iMultipleThreadIdc = 0;  // Auto-detect threads
-        param.uiIntraPeriod = fps * 2;  // Keyframe every 2 seconds
+        param.uiIntraPeriod = fps * 5;  // Keyframe every 5 seconds (reduces stutter from large IDR frames)
         param.eSpsPpsIdStrategy = CONSTANT_ID;  // Constant SPS/PPS IDs (browser compatible)
 
         // Enable loop filter for better compression
@@ -777,6 +729,10 @@ public:
         param.sSpatialLayers[0].iSpatialBitrate = bitrate_kbps * 1000;
         param.sSpatialLayers[0].iMaxSpatialBitrate = bitrate_kbps * 1500;
         param.sSpatialLayers[0].sSliceArgument.uiSliceMode = SM_SINGLE_SLICE;
+
+        // Set H.264 level based on resolution (fixes "bitstream larger than level" warning)
+        // Level 5.1 supports up to 4K and 40Mbps - plenty of headroom for large dithered frames
+        param.sSpatialLayers[0].uiLevelIdc = LEVEL_5_1;
 
         if (encoder_->InitializeExt(&param) != 0) {
             fprintf(stderr, "H264: Failed to initialize encoder\n");
@@ -864,21 +820,27 @@ public:
         }
         frame_count++;
 
-        // Track frame types
+        // Track frame types and P frame sizes for averaging
+        static int64_t p_size_total = 0;
+        static int p_size_count = 0;
+
         if (is_idr) {
             idr_count++;
             fprintf(stderr, "H264: IDR frame %d, size=%d bytes (%.1f KB)\n",
                     frame_count, total_size, total_size / 1024.0f);
         } else if (info.eFrameType == videoFrameTypeP) {
             p_count++;
+            p_size_total += total_size;
+            p_size_count++;
         } else if (info.eFrameType == videoFrameTypeSkip) {
             skip_count++;
         }
 
         // Log frame type stats every 90 frames (3 seconds at 30fps)
         if (frame_count % 90 == 0) {
-            fprintf(stderr, "H264: Frame stats - total=%d IDR=%d P=%d skip=%d\n",
-                    frame_count, idr_count, p_count, skip_count);
+            int avg_p_size = p_size_count > 0 ? (int)(p_size_total / p_size_count) : 0;
+            fprintf(stderr, "H264: Frame stats - total=%d IDR=%d P=%d skip=%d avg_p=%d bytes\n",
+                    frame_count, idr_count, p_count, skip_count, avg_p_size);
         }
 
         if (info.eFrameType == videoFrameTypeSkip) {
@@ -1440,6 +1402,10 @@ public:
                     }
                 });
 
+                ws->onError([](std::string error) {
+                    fprintf(stderr, "[WebRTC] WebSocket error: %s\n", error.c_str());
+                });
+
                 ws->onClosed([this, ws]() {
                     std::lock_guard<std::mutex> lock(peers_mutex_);
                     auto it = ws_to_peer_id_.find(ws.get());
@@ -1447,6 +1413,7 @@ public:
                         peers_.erase(it->second);
                         ws_to_peer_id_.erase(it);
                         peer_count_--;
+                        fprintf(stderr, "[WebRTC] Peer disconnected, %d remaining\n", peer_count_.load());
                     }
                 });
             });
@@ -1483,6 +1450,12 @@ public:
         // Use the sendFrame method with FrameInfo for proper RTP timestamps
         rtc::FrameInfo frameInfo(elapsed);
 
+        // Log only IDR frame sends (P frames logged in stats summary)
+        if (is_keyframe) {
+            fprintf(stderr, "[WebRTC] Sending IDR frame: %zu bytes to %d peers\n",
+                    data.size(), peer_count_.load());
+        }
+
         for (auto& [id, peer] : peers_) {
             if (peer->ready && peer->video_track && peer->video_track->isOpen()) {
                 try {
@@ -1492,7 +1465,7 @@ public:
                         data.size(),
                         frameInfo);
                 } catch (const std::exception& e) {
-                    fprintf(stderr, "[WebRTC] Send error: %s\n", e.what());
+                    fprintf(stderr, "[WebRTC] Send error to %s: %s\n", id.c_str(), e.what());
                 }
             }
         }
@@ -1513,6 +1486,8 @@ private:
 
             rtc::Configuration config;
             config.iceServers.emplace_back("stun:stun.l.google.com:19302");
+            // Allow large video frames (up to 16MB for high-res dithered content)
+            config.maxMessageSize = 16 * 1024 * 1024;
 
             peer->pc = std::make_shared<rtc::PeerConnection>(config);
 
@@ -1539,8 +1514,12 @@ private:
             });
 
             // Add video track with H.264 codec
+            // Use profile-level-id=42e01f (Constrained Baseline, Level 3.1) in SDP
+            // This matches what browsers advertise for WebRTC H.264 support.
+            // Browsers can still decode higher levels, they just don't advertise it.
+            // level-asymmetry-allowed=1 means we can send higher levels than advertised.
             rtc::Description::Video media("video-stream", rtc::Description::Direction::SendOnly);
-            media.addH264Codec(96);
+            media.addH264Codec(96, "profile-level-id=42e01f;packetization-mode=1;level-asymmetry-allowed=1");
             media.addSSRC(ssrc_, "video-stream", "stream1", "video-stream");
             peer->video_track = peer->pc->addTrack(media);
 
@@ -1852,10 +1831,7 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& encoder) {
     uint64_t last_mouse_click = 0;
     uint64_t last_key = 0;
 
-    // Blur filter for dithered 1-bit Mac screens
-    YPlaneBlur blur;
-
-    fprintf(stderr, "Video: Starting frame processing loop (with blur filter)\n");
+    fprintf(stderr, "Video: Starting frame processing loop\n");
 
     while (g_running) {
         auto now = std::chrono::steady_clock::now();
@@ -1962,13 +1938,8 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& encoder) {
             encoder.request_keyframe();
         }
 
-        // Apply blur to Y plane to reduce dithering noise before encoding
-        // Buffer is sized using stride*height to match source layout
-        uint8_t* blurred_y = blur.get_buffer(y_stride, height);
-        blur.blur(y, blurred_y, width, height, y_stride);
-
-        // Encode blurred I420 (U/V planes unchanged)
-        auto encoded = encoder.encode_i420(blurred_y, u, v, width, height, y_stride, uv_stride);
+        // Encode I420 directly
+        auto encoded = encoder.encode_i420(y, u, v, width, height, y_stride, uv_stride);
         if (!encoded.empty()) {
             bool is_keyframe = encoder.is_keyframe(encoded);
             webrtc.send_frame(encoded, is_keyframe);
