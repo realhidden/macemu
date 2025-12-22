@@ -1,11 +1,11 @@
 /*
  * Standalone WebRTC Server for macemu (BasiliskII / SheepShaver)
  *
- * Architecture (v3):
+ * Architecture (v4):
  * - Server CONNECTS to emulator resources by PID
  * - Emulator creates SHM (/macemu-video-{PID}) and socket (/tmp/macemu-{PID}.sock)
- * - Emulator converts Mac framebuffer to I420
- * - Server reads I420 directly and encodes to H.264 (zero-copy read)
+ * - Emulator converts Mac framebuffer to BGRA (B,G,R,A bytes = libyuv "ARGB")
+ * - Server encodes to H.264 (via I420 conversion) or PNG (via RGB conversion)
  * - Server handles browser keycode to Mac keycode conversion
  */
 
@@ -31,6 +31,7 @@
 #include <sstream>
 #include <fstream>
 #include <csignal>
+#include <iomanip>
 
 // POSIX IPC and process management
 #include <fcntl.h>
@@ -58,9 +59,6 @@ static std::string g_prefs_path = "basilisk_ii.prefs";
 static std::string g_emulator_path;    // Path to BasiliskII/SheepShaver executable
 static bool g_auto_start_emulator = true;
 static pid_t g_target_emulator_pid = 0;  // If specified, connect to this PID
-static bool g_test_pattern_mode = false;  // Generate test pattern instead of emulator frames
-static int g_test_pattern_width = 640;
-static int g_test_pattern_height = 480;
 static CodecType g_server_codec = CodecType::PNG;  // Server-side codec preference (default: PNG)
 
 // Global state
@@ -80,6 +78,7 @@ static std::string g_connected_socket_path;
 static std::atomic<uint64_t> g_mouse_move_count(0);
 static std::atomic<uint64_t> g_mouse_click_count(0);
 static std::atomic<uint64_t> g_key_count(0);
+
 
 // Global flag to request keyframe (set when new peer connects)
 static std::atomic<bool> g_request_keyframe(false);
@@ -313,7 +312,7 @@ static bool send_key_input(int mac_keycode, bool down) {
     return send(g_control_socket, &msg, sizeof(msg), MSG_NOSIGNAL) == sizeof(msg);
 }
 
-static bool send_mouse_input(int dx, int dy, uint8_t buttons) {
+static bool send_mouse_input(int dx, int dy, uint8_t buttons, uint64_t browser_timestamp_ms) {
     if (g_control_socket < 0) return false;
 
     MacEmuMouseInput msg;
@@ -324,6 +323,7 @@ static bool send_mouse_input(int dx, int dy, uint8_t buttons) {
     msg.y = dy;
     msg.buttons = buttons;
     memset(msg._reserved, 0, sizeof(msg._reserved));
+    msg.timestamp_ms = browser_timestamp_ms;
 
     return send(g_control_socket, &msg, sizeof(msg), MSG_NOSIGNAL) == sizeof(msg);
 }
@@ -553,135 +553,6 @@ static int check_emulator_status() {
     }
     return -1;  // Error
 }
-
-
-/*
- * Test Pattern Generator - generates simple moving patterns for testing
- * Bypasses the emulator entirely to test encoding/WebRTC pipeline
- */
-
-class TestPatternGenerator {
-public:
-    TestPatternGenerator(int width, int height) : width_(width), height_(height) {
-        // Allocate I420 buffer
-        int y_size = width * height;
-        int uv_size = (width / 2) * (height / 2);
-        buffer_.resize(y_size + uv_size * 2);
-
-        y_plane_ = buffer_.data();
-        u_plane_ = y_plane_ + y_size;
-        v_plane_ = u_plane_ + uv_size;
-
-        fprintf(stderr, "TestPattern: Initialized %dx%d generator\n", width, height);
-    }
-
-    void generate_frame() {
-        frame_count_++;
-
-        // Moving rectangle position (bounces around)
-        int rect_w = 100;
-        int rect_h = 80;
-
-        // Calculate position based on frame count (simple bounce animation)
-        int max_x = width_ - rect_w;
-        int max_y = height_ - rect_h;
-
-        // Use different speeds for x and y to create interesting pattern
-        int period_x = max_x * 2;
-        int period_y = max_y * 2;
-
-        int pos_in_cycle_x = (frame_count_ * 3) % period_x;
-        int pos_in_cycle_y = (frame_count_ * 2) % period_y;
-
-        rect_x_ = pos_in_cycle_x < max_x ? pos_in_cycle_x : period_x - pos_in_cycle_x;
-        rect_y_ = pos_in_cycle_y < max_y ? pos_in_cycle_y : period_y - pos_in_cycle_y;
-
-        // Clear to solid background color (dark blue in YUV)
-        // Y=29, U=255, V=107 is approximately RGB(0, 0, 128) dark blue
-        uint8_t bg_y = 29;
-        uint8_t bg_u = 255;
-        uint8_t bg_v = 107;
-
-        // Fill Y plane with background
-        memset(y_plane_, bg_y, width_ * height_);
-
-        // Fill U and V planes with background
-        int uv_width = width_ / 2;
-        int uv_height = height_ / 2;
-        memset(u_plane_, bg_u, uv_width * uv_height);
-        memset(v_plane_, bg_v, uv_width * uv_height);
-
-        // Draw a bright rectangle (white: Y=235, U=128, V=128)
-        uint8_t rect_y = 235;
-        uint8_t rect_u = 128;
-        uint8_t rect_v = 128;
-
-        // Fill rectangle in Y plane
-        for (int y = rect_y_; y < rect_y_ + rect_h && y < height_; y++) {
-            for (int x = rect_x_; x < rect_x_ + rect_w && x < width_; x++) {
-                y_plane_[y * width_ + x] = rect_y;
-            }
-        }
-
-        // Fill rectangle in U/V planes (every 2x2 block)
-        for (int y = rect_y_ / 2; y < (rect_y_ + rect_h) / 2 && y < uv_height; y++) {
-            for (int x = rect_x_ / 2; x < (rect_x_ + rect_w) / 2 && x < uv_width; x++) {
-                u_plane_[y * uv_width + x] = rect_u;
-                v_plane_[y * uv_width + x] = rect_v;
-            }
-        }
-
-        // Add a second colored rectangle (red: Y=81, U=90, V=240)
-        int rect2_x = (width_ - rect_w) - rect_x_;  // Mirror of first rect
-        int rect2_y = (height_ - rect_h) - rect_y_;
-        uint8_t rect2_y_val = 81;
-        uint8_t rect2_u = 90;
-        uint8_t rect2_v = 240;
-
-        // Fill second rectangle in Y plane
-        for (int y = rect2_y; y < rect2_y + rect_h && y < height_; y++) {
-            for (int x = rect2_x; x < rect2_x + rect_w && x < width_; x++) {
-                y_plane_[y * width_ + x] = rect2_y_val;
-            }
-        }
-
-        // Fill second rectangle in U/V planes
-        for (int y = rect2_y / 2; y < (rect2_y + rect_h) / 2 && y < uv_height; y++) {
-            for (int x = rect2_x / 2; x < (rect2_x + rect_w) / 2 && x < uv_width; x++) {
-                u_plane_[y * uv_width + x] = rect2_u;
-                v_plane_[y * uv_width + x] = rect2_v;
-            }
-        }
-
-        // Add frame counter as simple bar at top (shows animation is working)
-        int bar_width = (frame_count_ % width_);
-        for (int x = 0; x < bar_width; x++) {
-            for (int y = 0; y < 10; y++) {
-                y_plane_[y * width_ + x] = 180;  // Gray bar
-            }
-        }
-    }
-
-    uint8_t* y_plane() { return y_plane_; }
-    uint8_t* u_plane() { return u_plane_; }
-    uint8_t* v_plane() { return v_plane_; }
-    int width() { return width_; }
-    int height() { return height_; }
-    int y_stride() { return width_; }
-    int uv_stride() { return width_ / 2; }
-    uint64_t frame_count() { return frame_count_; }
-
-private:
-    int width_;
-    int height_;
-    std::vector<uint8_t> buffer_;
-    uint8_t* y_plane_ = nullptr;
-    uint8_t* u_plane_ = nullptr;
-    uint8_t* v_plane_ = nullptr;
-    int rect_x_ = 0;
-    int rect_y_ = 0;
-    uint64_t frame_count_ = 0;
-};
 
 
 /*
@@ -1061,6 +932,12 @@ private:
                 json << ", \"height\": " << g_video_shm->height;
                 json << ", \"frame_count\": " << ATOMIC_LOAD(g_video_shm->frame_count);
                 json << ", \"state\": " << g_video_shm->state << "}";
+
+                // Mouse latency from emulator (stored as x10 for 0.1ms precision)
+                uint32_t latency_x10 = ATOMIC_LOAD(g_video_shm->mouse_latency_avg_ms);
+                uint32_t latency_samples = ATOMIC_LOAD(g_video_shm->mouse_latency_samples);
+                json << ", \"mouse_latency_ms\": " << std::fixed << std::setprecision(1) << (latency_x10 / 10.0);
+                json << ", \"mouse_latency_samples\": " << latency_samples;
             }
             json << "}";
             send_json_response(fd, json.str());
@@ -1311,9 +1188,20 @@ public:
         }
     }
 
-    // Send PNG frame via DataChannel (binary)
-    void send_png_frame(const std::vector<uint8_t>& data) {
+    // Send PNG frame via DataChannel (binary) with timestamp header for latency measurement
+    // Frame format: [8-byte timestamp_ms (little-endian)] [PNG data]
+    void send_png_frame(const std::vector<uint8_t>& data, uint64_t timestamp_ms) {
         if (data.empty() || peer_count_ == 0) return;
+
+        // Build frame with timestamp header
+        std::vector<uint8_t> frame_with_header(8 + data.size());
+
+        // 8-byte little-endian timestamp
+        for (int i = 0; i < 8; i++) {
+            frame_with_header[i] = (timestamp_ms >> (i * 8)) & 0xFF;
+        }
+        // Copy PNG data
+        memcpy(frame_with_header.data() + 8, data.data(), data.size());
 
         std::lock_guard<std::mutex> lock(peers_mutex_);
 
@@ -1322,8 +1210,8 @@ public:
             if (peer->ready && peer->data_channel && peer->data_channel->isOpen()) {
                 try {
                     peer->data_channel->send(
-                        reinterpret_cast<const std::byte*>(data.data()),
-                        data.size());
+                        reinterpret_cast<const std::byte*>(frame_with_header.data()),
+                        frame_with_header.size());
                 } catch (const std::exception& e) {
                     fprintf(stderr, "[WebRTC] PNG send error to %s: %s\n", id.c_str(), e.what());
                 }
@@ -1588,31 +1476,39 @@ private:
 
         switch (cmd) {
             case 'M': {
-                // Mouse move: M dx,dy
+                // Mouse move: M dx,dy,timestamp
                 int dx = 0, dy = 0;
-                if (sscanf(args, "%d,%d", &dx, &dy) == 2) {
-                    send_mouse_input(dx, dy, current_buttons);
+                double ts = 0;
+                if (sscanf(args, "%d,%d,%lf", &dx, &dy, &ts) >= 2) {
+                    uint64_t browser_ts = static_cast<uint64_t>(ts);
+                    send_mouse_input(dx, dy, current_buttons, browser_ts);
                     g_mouse_move_count++;
                 }
                 break;
             }
             case 'D': {
-                // Mouse down: D button
-                int button = atoi(args);
+                // Mouse down: D button,timestamp
+                int button = 0;
+                double ts = 0;
+                sscanf(args, "%d,%lf", &button, &ts);
                 if (button == 0) current_buttons |= MACEMU_MOUSE_LEFT;
                 else if (button == 1) current_buttons |= MACEMU_MOUSE_MIDDLE;
                 else if (button == 2) current_buttons |= MACEMU_MOUSE_RIGHT;
-                send_mouse_input(0, 0, current_buttons);
+                uint64_t browser_ts = static_cast<uint64_t>(ts);
+                send_mouse_input(0, 0, current_buttons, browser_ts);
                 g_mouse_click_count++;
                 break;
             }
             case 'U': {
-                // Mouse up: U button
-                int button = atoi(args);
+                // Mouse up: U button,timestamp
+                int button = 0;
+                double ts = 0;
+                sscanf(args, "%d,%lf", &button, &ts);
                 if (button == 0) current_buttons &= ~MACEMU_MOUSE_LEFT;
                 else if (button == 1) current_buttons &= ~MACEMU_MOUSE_MIDDLE;
                 else if (button == 2) current_buttons &= ~MACEMU_MOUSE_RIGHT;
-                send_mouse_input(0, 0, current_buttons);
+                uint64_t browser_ts = static_cast<uint64_t>(ts);
+                send_mouse_input(0, 0, current_buttons, browser_ts);
                 g_mouse_click_count++;
                 break;
             }
@@ -1655,82 +1551,6 @@ private:
 
 
 /*
- * Test pattern video loop - generates frames without emulator
- */
-
-static void test_pattern_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncoder& png_encoder) {
-    fprintf(stderr, "TestPattern: Starting test pattern mode %dx%d @ 30fps\n",
-            g_test_pattern_width, g_test_pattern_height);
-
-    TestPatternGenerator pattern(g_test_pattern_width, g_test_pattern_height);
-
-    auto last_frame_time = std::chrono::steady_clock::now();
-    auto last_stats_time = std::chrono::steady_clock::now();
-    int frames_encoded = 0;
-    const int target_fps = 30;
-    const auto frame_duration = std::chrono::microseconds(1000000 / target_fps);
-
-    while (g_running) {
-        auto now = std::chrono::steady_clock::now();
-
-        // Rate limit to target FPS
-        auto elapsed = now - last_frame_time;
-        if (elapsed < frame_duration) {
-            std::this_thread::sleep_for(frame_duration - elapsed);
-            now = std::chrono::steady_clock::now();
-        }
-        last_frame_time = now;
-
-        // Generate test frame
-        pattern.generate_frame();
-
-        // Check if keyframe requested (new peer connected)
-        if (g_request_keyframe.exchange(false)) {
-            h264_encoder.request_keyframe();
-        }
-
-        // Encode and send to H.264 peers
-        if (webrtc.has_codec_peer(CodecType::H264)) {
-            auto frame = h264_encoder.encode_i420(
-                pattern.y_plane(), pattern.u_plane(), pattern.v_plane(),
-                pattern.width(), pattern.height(),
-                pattern.y_stride(), pattern.uv_stride());
-
-            if (!frame.data.empty()) {
-                webrtc.send_h264_frame(frame.data, frame.is_keyframe);
-                frames_encoded++;
-            }
-        }
-
-        // Encode and send to PNG peers
-        if (webrtc.has_codec_peer(CodecType::PNG)) {
-            auto frame = png_encoder.encode_i420(
-                pattern.y_plane(), pattern.u_plane(), pattern.v_plane(),
-                pattern.width(), pattern.height(),
-                pattern.y_stride(), pattern.uv_stride());
-
-            if (!frame.data.empty()) {
-                webrtc.send_png_frame(frame.data);
-                frames_encoded++;
-            }
-        }
-
-        // Print stats every 3 seconds
-        auto stats_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_stats_time);
-        if (stats_elapsed.count() >= 3000) {
-            float fps = frames_encoded * 1000.0f / stats_elapsed.count();
-            fprintf(stderr, "[TestPattern] fps=%.1f peers=%d frames=%lu\n",
-                    fps, webrtc.peer_count(), pattern.frame_count());
-            frames_encoded = 0;
-            last_stats_time = now;
-        }
-    }
-
-    fprintf(stderr, "TestPattern: Exiting\n");
-}
-
-
-/*
  * Main video processing loop
  */
 
@@ -1743,8 +1563,6 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
 
     // Track input counts between stats intervals
     uint64_t last_mouse_move = 0;
-    uint64_t last_mouse_click = 0;
-    uint64_t last_key = 0;
 
     fprintf(stderr, "Video: Starting frame processing loop\n");
 
@@ -1833,6 +1651,12 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
         }
         last_frame_count = current_count;
 
+        // Latency measurement: time from emulator frame completion to now
+        uint64_t frame_timestamp_us = ATOMIC_LOAD(g_video_shm->timestamp_us);
+        auto server_now = std::chrono::steady_clock::now();
+        uint64_t server_now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            server_now.time_since_epoch()).count();
+
         // Read frame dimensions
         uint32_t width = g_video_shm->width;
         uint32_t height = g_video_shm->height;
@@ -1841,12 +1665,10 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
             continue;
         }
 
-        // Get I420 planes from ready buffer (emulator has already converted)
-        uint8_t *y, *u, *v;
-        macemu_get_ready_i420(g_video_shm, &y, &u, &v);
-
-        int y_stride, uv_stride;
-        macemu_get_i420_strides(&y_stride, &uv_stride);
+        // Get BGRA frame from ready buffer
+        // Emulator always outputs BGRA (B,G,R,A bytes), which is libyuv "ARGB"
+        uint8_t* frame_data = macemu_get_ready_bgra(g_video_shm);
+        int stride = macemu_get_bgra_stride();
 
         // Check if keyframe requested (new peer connected)
         if (g_request_keyframe.exchange(false)) {
@@ -1854,21 +1676,43 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
         }
 
         // Encode and send to H.264 peers
+        auto encode_start = std::chrono::steady_clock::now();
         if (webrtc.has_codec_peer(CodecType::H264)) {
-            auto frame = h264_encoder.encode_i420(y, u, v, width, height, y_stride, uv_stride);
+            EncodedFrame frame = h264_encoder.encode_bgra(frame_data, width, height, stride);
             if (!frame.data.empty()) {
                 webrtc.send_h264_frame(frame.data, frame.is_keyframe);
                 frames_encoded++;
             }
         }
 
-        // Encode and send to PNG peers
+        // Encode and send to PNG peers (with timestamp for latency measurement)
         if (webrtc.has_codec_peer(CodecType::PNG)) {
-            auto frame = png_encoder.encode_i420(y, u, v, width, height, y_stride, uv_stride);
+            EncodedFrame frame = png_encoder.encode_bgra(frame_data, width, height, stride);
             if (!frame.data.empty()) {
-                webrtc.send_png_frame(frame.data);
+                // Generate synchronized timestamp for browser latency measurement
+                // Uses same epoch scheme as mouse input (browser syncs on first message)
+                uint64_t frame_timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    server_now.time_since_epoch()).count();
+
+                webrtc.send_png_frame(frame.data, frame_timestamp_ms);
                 frames_encoded++;
             }
+        }
+        auto encode_end = std::chrono::steady_clock::now();
+
+        // Track latency stats
+        static uint64_t total_shm_latency_us = 0;
+        static uint64_t total_encode_latency_us = 0;
+        static int latency_samples = 0;
+
+        if (frame_timestamp_us > 0) {
+            uint64_t shm_latency = server_now_us - frame_timestamp_us;
+            uint64_t encode_latency = std::chrono::duration_cast<std::chrono::microseconds>(
+                encode_end - encode_start).count();
+
+            total_shm_latency_us += shm_latency;
+            total_encode_latency_us += encode_latency;
+            latency_samples++;
         }
 
         // Print stats every 3 seconds
@@ -1878,20 +1722,24 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
 
             // Calculate input rates
             uint64_t cur_mouse_move = g_mouse_move_count.load();
-            uint64_t cur_mouse_click = g_mouse_click_count.load();
-            uint64_t cur_key = g_key_count.load();
-
             uint64_t mouse_moves = cur_mouse_move - last_mouse_move;
-            uint64_t mouse_clicks = cur_mouse_click - last_mouse_click;
-            uint64_t keys = cur_key - last_key;
-
             float mouse_rate = mouse_moves * 1000.0f / stats_elapsed.count();
 
-            fprintf(stderr, "[Server] fps=%.1f peers=%d emu=%s pid=%d | input: mouse=%.0f/s clicks=%lu keys=%lu\n",
+            // Calculate average video latencies (server-side only)
+            float avg_shm_ms = latency_samples > 0 ? (total_shm_latency_us / latency_samples) / 1000.0f : 0;
+            float avg_encode_ms = latency_samples > 0 ? (total_encode_latency_us / latency_samples) / 1000.0f : 0;
+
+            fprintf(stderr, "[Server] fps=%.1f peers=%d emu=%s pid=%d | video: shm=%.1fms enc=%.1fms | mouse=%.0f/s\n",
                     fps, webrtc.peer_count(),
                     g_emulator_connected ? "connected" : "scanning",
                     g_emulator_pid,
-                    mouse_rate, mouse_clicks, keys);
+                    avg_shm_ms, avg_encode_ms,
+                    mouse_rate);
+
+            // Reset latency counters
+            total_shm_latency_us = 0;
+            total_encode_latency_us = 0;
+            latency_samples = 0;
 
             // Save frame as PPM (readable image format) for debugging
             static int frame_save_count = 0;
@@ -1900,39 +1748,26 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
                 snprintf(filename, sizeof(filename), "frame_%d_%dx%d.ppm", frame_save_count, width, height);
                 FILE* f = fopen(filename, "wb");
                 if (f) {
-                    // Convert I420 to RGB and save as PPM
+                    // Convert BGRA frame to RGB and save as PPM
+                    // BGRA = bytes B,G,R,A (libyuv "ARGB")
                     fprintf(f, "P6\n%d %d\n255\n", width, height);
                     for (uint32_t row = 0; row < height; row++) {
                         for (uint32_t col = 0; col < width; col++) {
-                            // Get Y value (use original, not blurred for debugging)
-                            int Y = y[row * y_stride + col];
-                            // Get U, V values (subsampled 2x2)
-                            int U = u[(row/2) * uv_stride + (col/2)];
-                            int V = v[(row/2) * uv_stride + (col/2)];
-                            // YUV to RGB conversion
-                            int C = Y - 16;
-                            int D = U - 128;
-                            int E = V - 128;
-                            int R = (298 * C + 409 * E + 128) >> 8;
-                            int G = (298 * C - 100 * D - 208 * E + 128) >> 8;
-                            int B = (298 * C + 516 * D + 128) >> 8;
-                            // Clamp
-                            R = R < 0 ? 0 : (R > 255 ? 255 : R);
-                            G = G < 0 ? 0 : (G > 255 ? 255 : G);
-                            B = B < 0 ? 0 : (B > 255 ? 255 : B);
-                            uint8_t rgb[3] = {(uint8_t)R, (uint8_t)G, (uint8_t)B};
+                            const uint8_t* pixel = frame_data + row * stride + col * 4;
+                            uint8_t B = pixel[0];
+                            uint8_t G = pixel[1];
+                            uint8_t R = pixel[2];
+                            uint8_t rgb[3] = {R, G, B};
                             fwrite(rgb, 1, 3, f);
                         }
                     }
                     fclose(f);
-                    fprintf(stderr, "[Server] Saved debug frame: %s\n", filename);
+                    fprintf(stderr, "[Server] Saved debug frame: %s (BGRA)\n", filename);
                     frame_save_count++;
                 }
             }
 
             last_mouse_move = cur_mouse_move;
-            last_mouse_click = cur_mouse_click;
-            last_key = cur_key;
             frames_encoded = 0;
             last_stats_time = now;
         }
@@ -1955,15 +1790,10 @@ static void print_usage(const char* program) {
     fprintf(stderr, "  -e, --emulator PATH     Path to BasiliskII/SheepShaver executable\n");
     fprintf(stderr, "  -P, --prefs FILE        Emulator prefs file (default: basilisk_ii.prefs)\n");
     fprintf(stderr, "  -n, --no-auto-start     Don't auto-start emulator (wait for external)\n");
-    fprintf(stderr, "  -t, --test-pattern      Generate test pattern (no emulator needed)\n");
-    fprintf(stderr, "  --test-size WxH         Test pattern size (default: 640x480)\n");
     fprintf(stderr, "  --pid PID               Connect to specific emulator PID\n");
     fprintf(stderr, "  --roms PATH             ROMs directory (default: storage/roms)\n");
     fprintf(stderr, "  --images PATH           Disk images directory (default: storage/images)\n");
-    fprintf(stderr, "\nTest Pattern Mode:\n");
-    fprintf(stderr, "  Use -t/--test-pattern to generate a moving test pattern without\n");
-    fprintf(stderr, "  needing the emulator. This helps debug the encoding/WebRTC pipeline.\n");
-    fprintf(stderr, "\nNew architecture (v3):\n");
+    fprintf(stderr, "\nArchitecture:\n");
     fprintf(stderr, "  - Emulator creates SHM at /macemu-video-{PID}\n");
     fprintf(stderr, "  - Emulator creates socket at /tmp/macemu-{PID}.sock\n");
     fprintf(stderr, "  - Server connects to emulator resources by PID\n");
@@ -1990,14 +1820,12 @@ int main(int argc, char* argv[]) {
         {"emulator",     required_argument, 0, 'e'},
         {"prefs",        required_argument, 0, 'P'},
         {"no-auto-start", no_argument,      0, 'n'},
-        {"test-pattern", no_argument,       0, 't'},
-        {"test-size",    required_argument, 0, 1001},
         {"pid",          required_argument, 0, 1000},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "hp:s:e:nP:t", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "hp:s:e:nP:", long_options, nullptr)) != -1) {
         switch (opt) {
             case 'h':
                 print_usage(argv[0]);
@@ -2023,18 +1851,8 @@ int main(int argc, char* argv[]) {
             case 'n':
                 g_auto_start_emulator = false;
                 break;
-            case 't':
-                g_test_pattern_mode = true;
-                break;
             case 1000:
                 g_target_emulator_pid = atoi(optarg);
-                break;
-            case 1001:
-                // Parse WxH format
-                if (sscanf(optarg, "%dx%d", &g_test_pattern_width, &g_test_pattern_height) != 2) {
-                    fprintf(stderr, "Invalid test-size format. Use WxH (e.g., 640x480)\n");
-                    return 1;
-                }
                 break;
             default:
                 print_usage(argv[0]);
@@ -2087,40 +1905,31 @@ int main(int argc, char* argv[]) {
     H264Encoder h264_encoder;
     PNGEncoder png_encoder;
 
-    if (g_test_pattern_mode) {
-        // Test pattern mode - no emulator needed
-        fprintf(stderr, "\n*** TEST PATTERN MODE ***\n");
-        fprintf(stderr, "Generating %dx%d test pattern at 30fps\n", g_test_pattern_width, g_test_pattern_height);
-        fprintf(stderr, "This mode does not require the emulator.\n\n");
-        test_pattern_loop(webrtc, h264_encoder, png_encoder);
-    } else {
-        // Normal mode - connect to emulator
-        // Auto-start emulator if enabled
-        if (g_auto_start_emulator && g_target_emulator_pid == 0) {
-            std::string emu = find_emulator();
-            if (!emu.empty()) {
-                fprintf(stderr, "Found emulator: %s\n", emu.c_str());
-                if (start_emulator()) {
-                    fprintf(stderr, "Emulator started, waiting for IPC resources...\n\n");
-                }
-            } else {
-                fprintf(stderr, "No emulator found. Use --emulator PATH or place BasiliskII in current directory.\n");
-                fprintf(stderr, "Scanning for running emulators...\n\n");
+    // Auto-start emulator if enabled
+    if (g_auto_start_emulator && g_target_emulator_pid == 0) {
+        std::string emu = find_emulator();
+        if (!emu.empty()) {
+            fprintf(stderr, "Found emulator: %s\n", emu.c_str());
+            if (start_emulator()) {
+                fprintf(stderr, "Emulator started, waiting for IPC resources...\n\n");
             }
-        } else if (g_target_emulator_pid > 0) {
-            fprintf(stderr, "Waiting to connect to emulator PID %d...\n\n", g_target_emulator_pid);
         } else {
-            fprintf(stderr, "Auto-start disabled, scanning for running emulators...\n\n");
+            fprintf(stderr, "No emulator found. Use --emulator PATH or place BasiliskII in current directory.\n");
+            fprintf(stderr, "Scanning for running emulators...\n\n");
         }
-
-        video_loop(webrtc, h264_encoder, png_encoder);
-
-        // Stop emulator if we started it
-        stop_emulator();
-
-        // Disconnect from emulator
-        disconnect_from_emulator();
+    } else if (g_target_emulator_pid > 0) {
+        fprintf(stderr, "Waiting to connect to emulator PID %d...\n\n", g_target_emulator_pid);
+    } else {
+        fprintf(stderr, "Auto-start disabled, scanning for running emulators...\n\n");
     }
+
+    video_loop(webrtc, h264_encoder, png_encoder);
+
+    // Stop emulator if we started it
+    stop_emulator();
+
+    // Disconnect from emulator
+    disconnect_from_emulator();
 
     // Cleanup
     webrtc.shutdown();

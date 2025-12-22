@@ -25,8 +25,11 @@ public:
     EncodedFrame encode_i420(const uint8_t* y, const uint8_t* u, const uint8_t* v,
                              int width, int height, int y_stride, int uv_stride) override;
 
-    // PNG can also encode directly from BGRA (more efficient)
+    // Encode from BGRA (bytes B,G,R,A - libyuv "ARGB")
     EncodedFrame encode_bgra(const uint8_t* bgra, int width, int height, int stride) override;
+
+    // Encode from ARGB (bytes A,R,G,B - libyuv "BGRA", Mac native 32-bit)
+    EncodedFrame encode_argb(const uint8_t* argb, int width, int height, int stride);
 
     void request_keyframe() override {
         // PNG frames are always keyframes (no inter-frame compression)

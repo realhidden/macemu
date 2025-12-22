@@ -136,12 +136,57 @@ EncodedFrame PNGEncoder::encode_bgra(const uint8_t* bgra, int width, int height,
     }
 
     // Convert BGRA to RGB using libyuv
-    // ARGBToRAW converts BGRA (in memory order) to RGB
+    // BGRA = bytes B,G,R,A = libyuv "ARGB"
+    // ARGBToRAW converts to RGB
     libyuv::ARGBToRAW(
         bgra, stride,
         rgb_buffer_.data(), width * 3,
         width, height
     );
+
+    // Encode to PNG using fpng
+    if (!encode_rgb_to_png(width, height)) {
+        return result;
+    }
+
+    result.data = std::move(png_buffer_);
+    png_buffer_.clear();
+
+    frame_count_++;
+    total_size_ += result.data.size();
+
+    return result;
+}
+
+EncodedFrame PNGEncoder::encode_argb(const uint8_t* argb, int width, int height, int stride) {
+    EncodedFrame result;
+    result.codec = CodecType::PNG;
+    result.width = width;
+    result.height = height;
+    result.is_keyframe = true;
+
+    // Reinit if size changed
+    if (width != width_ || height != height_) {
+        if (!init(width, height)) {
+            return result;
+        }
+    }
+
+    // Convert ARGB to RGB manually
+    // ARGB = bytes A,R,G,B in memory (Mac native 32-bit)
+    // RGB = bytes R,G,B in memory
+    // libyuv doesn't have a direct function for this, so we do it manually
+    uint8_t* dst = rgb_buffer_.data();
+    for (int row = 0; row < height; row++) {
+        const uint8_t* src_row = argb + row * stride;
+        uint8_t* dst_row = dst + row * width * 3;
+        for (int col = 0; col < width; col++) {
+            // ARGB bytes: A, R, G, B at offsets 0, 1, 2, 3
+            dst_row[col * 3 + 0] = src_row[col * 4 + 1];  // R
+            dst_row[col * 3 + 1] = src_row[col * 4 + 2];  // G
+            dst_row[col * 3 + 2] = src_row[col * 4 + 3];  // B
+        }
+    }
 
     // Encode to PNG using fpng
     if (!encode_rgb_to_png(width, height)) {

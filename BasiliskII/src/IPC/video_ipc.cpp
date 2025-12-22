@@ -127,6 +127,12 @@ static std::atomic<int> mouse_delta_x(0);
 static std::atomic<int> mouse_delta_y(0);
 static std::atomic<bool> pending_mouse_update(false);
 
+// Mouse latency tracking (browser timestamp → emulator receive)
+static std::atomic<uint64_t> mouse_latency_total_ms(0);
+static std::atomic<int> mouse_latency_samples(0);
+static std::chrono::steady_clock::time_point latency_epoch;
+static bool latency_epoch_set = false;
+
 // Palette for indexed color modes
 static uint8 current_palette[256 * 3];
 
@@ -277,6 +283,26 @@ static void process_binary_input(const uint8_t* data, size_t len) {
         case MACEMU_INPUT_MOUSE: {
             if (len < sizeof(MacEmuMouseInput)) return;
             const MacEmuMouseInput* mouse = (const MacEmuMouseInput*)data;
+
+            // Measure end-to-end mouse latency
+            // Browser sends performance.now() in ms, we compare to our steady_clock
+            if (mouse->timestamp_ms > 0) {
+                // Set epoch on first message to sync browser and emulator clocks
+                if (!latency_epoch_set) {
+                    latency_epoch = std::chrono::steady_clock::now() -
+                                    std::chrono::milliseconds(mouse->timestamp_ms);
+                    latency_epoch_set = true;
+                }
+                // Calculate latency: current time - (epoch + browser_timestamp)
+                auto now = std::chrono::steady_clock::now();
+                auto browser_time = latency_epoch + std::chrono::milliseconds(mouse->timestamp_ms);
+                auto latency = std::chrono::duration_cast<std::chrono::milliseconds>(now - browser_time);
+                if (latency.count() >= 0 && latency.count() < 1000) {  // Sanity check
+                    mouse_latency_total_ms.fetch_add(latency.count());
+                    mouse_latency_samples.fetch_add(1);
+                }
+            }
+
             // Accumulate mouse deltas
             mouse_delta_x.fetch_add(mouse->x);
             mouse_delta_y.fetch_add(mouse->y);
@@ -388,97 +414,77 @@ static void control_socket_thread() {
 
 
 /*
- *  Convert Mac framebuffer to I420 and signal frame complete
+ *  Convert Mac framebuffer to BGRA and signal frame complete
  *
- *  Supports all Mac pixel formats via libyuv:
- *  - 32-bit ARGB (big-endian, which is BGRA in memory on little-endian)
- *  - 16-bit RGB555
- *  - 8/4/2/1-bit indexed with palette
+ *  Always outputs BGRA (bytes B,G,R,A in memory) which is libyuv "ARGB".
+ *  This simplifies the server to a single code path.
+ *
+ *  - 32-bit Mac: Shuffle A,R,G,B → B,G,R,A using libyuv::ARGBToBGRA
+ *  - 16-bit/indexed: Convert to BGRA directly
  */
 
-static void convert_frame_to_i420() {
+static void convert_frame_to_bgra() {
     if (!video_shm || !the_buffer) return;
 
     uint32_t width = video_shm->width;
     uint32_t height = video_shm->height;
     if (width == 0 || height == 0) return;
 
-    // Get write buffer pointers
+    // Get write buffer pointer
     uint32_t write_idx = ATOMIC_LOAD(video_shm->write_index);
-    uint8_t *y_plane, *u_plane, *v_plane;
-    macemu_get_i420_planes(video_shm, write_idx, &y_plane, &u_plane, &v_plane);
+    uint8_t* dst_frame = macemu_get_frame_ptr(video_shm, write_idx);
+    int dst_stride = macemu_get_bgra_stride();
 
-    int y_stride = MACEMU_MAX_WIDTH;
-    int uv_stride = MACEMU_MAX_WIDTH / 2;
+    // Always output BGRA
+    video_shm->pixel_format = MACEMU_PIXFMT_BGRA;
 
-    // Convert based on current depth
     switch (frame_depth) {
         case 32: {
-            // Mac 32-bit is big-endian ARGB = A,R,G,B bytes in memory
-            // BGRAToI420 expects A,R,G,B in memory
-            libyuv::BGRAToI420(
-                the_buffer, frame_bytes_per_row,
-                y_plane, y_stride,
-                u_plane, uv_stride,
-                v_plane, uv_stride,
+            // Mac 32-bit: bytes A,R,G,B in memory (libyuv calls this "BGRA")
+            // Convert to bytes B,G,R,A (libyuv calls this "ARGB")
+            // libyuv::ARGBToBGRA shuffles BGRA→ARGB (or equivalently ARGB→BGRA)
+            // It's a symmetric shuffle: ABGR↔RGBA, so ARGBToBGRA works both ways
+            libyuv::ARGBToBGRA(
+                the_buffer, frame_bytes_per_row,  // Source: A,R,G,B bytes (Mac native)
+                dst_frame, dst_stride,             // Dest: B,G,R,A bytes
                 width, height
             );
             break;
         }
         case 16: {
-            // Mac big-endian RGB555 - need to convert to ARGB first
-            // libyuv expects little-endian ARGB1555, so we use a temp buffer
-            size_t argb_size = width * height * 4;
-            uint8_t* argb_temp = new uint8_t[argb_size];
-
-            // Convert RGB555 to ARGB (handling big-endian)
+            // Mac big-endian RGB555 - convert to BGRA (B,G,R,A bytes)
             const uint8_t* src = the_buffer;
-            uint8_t* dst = argb_temp;
             for (uint32_t row = 0; row < height; row++) {
                 const uint16_t* src_row = (const uint16_t*)(src + row * frame_bytes_per_row);
-                uint8_t* dst_row = dst + row * width * 4;
+                uint8_t* dst_row = dst_frame + row * dst_stride;
                 for (uint32_t x = 0; x < width; x++) {
                     // Mac big-endian RGB555: 0RRRRRGGGGGBBBBB
                     uint16_t pixel = src_row[x];
-                    // Swap bytes if little-endian
+                    // Swap bytes if little-endian host
                     #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
                     pixel = (pixel >> 8) | (pixel << 8);
                     #endif
                     uint8_t r = ((pixel >> 10) & 0x1F) << 3;
                     uint8_t g = ((pixel >> 5) & 0x1F) << 3;
                     uint8_t b = (pixel & 0x1F) << 3;
-                    // BGRA order for libyuv ARGBToI420
+                    // BGRA byte order (B,G,R,A)
                     dst_row[x * 4 + 0] = b;
                     dst_row[x * 4 + 1] = g;
                     dst_row[x * 4 + 2] = r;
                     dst_row[x * 4 + 3] = 255;
                 }
             }
-
-            libyuv::ARGBToI420(
-                argb_temp, width * 4,
-                y_plane, y_stride,
-                u_plane, uv_stride,
-                v_plane, uv_stride,
-                width, height
-            );
-            delete[] argb_temp;
             break;
         }
         case 8:
         case 4:
         case 2:
         case 1: {
-            // Indexed color modes - expand to ARGB using palette, then convert
-            size_t argb_size = width * height * 4;
-            uint8_t* argb_temp = new uint8_t[argb_size];
-
+            // Indexed color modes - expand to BGRA using palette
             const uint8_t* src = the_buffer;
-            uint8_t* dst = argb_temp;
-
             for (uint32_t row = 0; row < height; row++) {
                 const uint8_t* src_row = src + row * frame_bytes_per_row;
-                uint8_t* dst_row = dst + row * width * 4;
+                uint8_t* dst_row = dst_frame + row * dst_stride;
 
                 for (uint32_t x = 0; x < width; x++) {
                     uint8_t index = 0;
@@ -503,29 +509,26 @@ static void convert_frame_to_i420() {
                     uint8_t g = current_palette[index * 3 + 1];
                     uint8_t b = current_palette[index * 3 + 2];
 
-                    // BGRA order for libyuv ARGBToI420
+                    // BGRA byte order (B,G,R,A)
                     dst_row[x * 4 + 0] = b;
                     dst_row[x * 4 + 1] = g;
                     dst_row[x * 4 + 2] = r;
                     dst_row[x * 4 + 3] = 255;
                 }
             }
-
-            libyuv::ARGBToI420(
-                argb_temp, width * 4,
-                y_plane, y_stride,
-                u_plane, uv_stride,
-                v_plane, uv_stride,
-                width, height
-            );
-            delete[] argb_temp;
             break;
         }
         default:
             // Unknown format - fill with gray
-            memset(y_plane, 128, MACEMU_I420_Y_SIZE);
-            memset(u_plane, 128, MACEMU_I420_UV_SIZE);
-            memset(v_plane, 128, MACEMU_I420_UV_SIZE);
+            for (uint32_t row = 0; row < height; row++) {
+                uint8_t* dst_row = dst_frame + row * dst_stride;
+                for (uint32_t x = 0; x < width; x++) {
+                    dst_row[x * 4 + 0] = 128;  // B
+                    dst_row[x * 4 + 1] = 128;  // G
+                    dst_row[x * 4 + 2] = 128;  // R
+                    dst_row[x * 4 + 3] = 255;  // A
+                }
+            }
             break;
     }
 
@@ -567,8 +570,22 @@ static void video_refresh_thread()
         auto stats_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_stats_time);
         if (stats_elapsed.count() >= 3000) {
             float fps = frames_sent * 1000.0f / stats_elapsed.count();
-            fprintf(stderr, "[IPC] fps=%.1f frames=%d mouse=%d server=%s\n",
-                    fps, frames_sent, mouse_updates,
+
+            // Calculate average mouse latency
+            int lat_samples = mouse_latency_samples.exchange(0);
+            uint64_t lat_total = mouse_latency_total_ms.exchange(0);
+            float avg_mouse_ms = lat_samples > 0 ? (float)lat_total / lat_samples : 0;
+
+            // Write latency stats to SHM for server to read
+            // Store as x10 for 0.1ms precision (e.g., 125 = 12.5ms)
+            if (video_shm) {
+                uint32_t latency_x10 = (uint32_t)(avg_mouse_ms * 10);
+                ATOMIC_STORE(video_shm->mouse_latency_avg_ms, latency_x10);
+                ATOMIC_STORE(video_shm->mouse_latency_samples, (uint32_t)lat_samples);
+            }
+
+            fprintf(stderr, "[IPC] fps=%.1f frames=%d mouse=%d latency=%.1fms server=%s\n",
+                    fps, frames_sent, mouse_updates, avg_mouse_ms,
                     control_socket >= 0 ? "connected" : "waiting");
             frames_sent = 0;
             mouse_updates = 0;
@@ -584,8 +601,8 @@ static void video_refresh_thread()
 
         last_frame_time = now;
 
-        // Convert frame to I420 and signal complete
-        convert_frame_to_i420();
+        // Convert frame to BGRA and signal complete
+        convert_frame_to_bgra();
         frames_sent++;
     }
 }

@@ -4,6 +4,7 @@
 
 #include "h264_encoder.h"
 #include <cstdio>
+#include <libyuv.h>
 
 bool H264Encoder::init(int width, int height, int fps) {
     return init_internal(width, height, fps, 2000);
@@ -194,4 +195,58 @@ bool H264Encoder::is_keyframe(const std::vector<uint8_t>& data) {
         }
     }
     return false;
+}
+
+EncodedFrame H264Encoder::encode_bgra(const uint8_t* bgra, int width, int height, int stride) {
+    // BGRA = bytes B,G,R,A = libyuv "ARGB"
+    // Convert to I420 using ARGBToI420
+
+    // Ensure I420 buffer is sized correctly
+    size_t y_size = width * height;
+    size_t uv_size = (width / 2) * (height / 2);
+    size_t total_size = y_size + 2 * uv_size;
+    if (i420_buffer_.size() < total_size) {
+        i420_buffer_.resize(total_size);
+    }
+
+    uint8_t* y = i420_buffer_.data();
+    uint8_t* u = y + y_size;
+    uint8_t* v = u + uv_size;
+
+    libyuv::ARGBToI420(
+        bgra, stride,
+        y, width,
+        u, width / 2,
+        v, width / 2,
+        width, height
+    );
+
+    return encode_i420(y, u, v, width, height, width, width / 2);
+}
+
+EncodedFrame H264Encoder::encode_argb(const uint8_t* argb, int width, int height, int stride) {
+    // ARGB = bytes A,R,G,B = libyuv "BGRA" (Mac native 32-bit)
+    // Convert to I420 using BGRAToI420
+
+    // Ensure I420 buffer is sized correctly
+    size_t y_size = width * height;
+    size_t uv_size = (width / 2) * (height / 2);
+    size_t total_size = y_size + 2 * uv_size;
+    if (i420_buffer_.size() < total_size) {
+        i420_buffer_.resize(total_size);
+    }
+
+    uint8_t* y = i420_buffer_.data();
+    uint8_t* u = y + y_size;
+    uint8_t* v = u + uv_size;
+
+    libyuv::BGRAToI420(
+        argb, stride,
+        y, width,
+        u, width / 2,
+        v, width / 2,
+        width, height
+    );
+
+    return encode_i420(y, u, v, width, height, width, width / 2);
 }

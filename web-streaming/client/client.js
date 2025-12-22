@@ -240,12 +240,19 @@ class H264Decoder extends VideoDecoder {
 }
 
 // PNG decoder using canvas rendering
+// Expects frames with 8-byte timestamp header for latency measurement
 class PNGDecoder extends VideoDecoder {
     constructor(canvasElement) {
         super(canvasElement);
         this.canvas = canvasElement;
         this.ctx = null;
         this.pendingBlob = null;
+
+        // Video latency tracking (server timestamp -> browser receive)
+        this.epochOffset = null;  // Offset to convert server timestamp to browser time
+        this.latencyTotal = 0;
+        this.latencySamples = 0;
+        this.lastLatencyLog = 0;
     }
 
     get type() { return CodecType.PNG; }
@@ -257,6 +264,10 @@ class PNGDecoder extends VideoDecoder {
             logger.error('Failed to get canvas 2D context');
             return false;
         }
+        // Reset latency tracking
+        this.epochOffset = null;
+        this.latencyTotal = 0;
+        this.latencySamples = 0;
         logger.info('PNGDecoder initialized');
         return true;
     }
@@ -265,12 +276,60 @@ class PNGDecoder extends VideoDecoder {
         this.ctx = null;
     }
 
+    // Get average video latency in ms
+    getAverageLatency() {
+        return this.latencySamples > 0 ? this.latencyTotal / this.latencySamples : 0;
+    }
+
     // Handle PNG data from DataChannel
+    // Frame format: [8-byte timestamp_ms (little-endian)] [PNG data]
     handleData(data) {
         if (!this.ctx) return;
 
-        // data should be an ArrayBuffer or Blob containing PNG
-        const blob = data instanceof Blob ? data : new Blob([data], { type: 'image/png' });
+        const receiveTime = performance.now();
+        let pngData = data;
+        let serverTimestamp = 0;
+
+        // Parse timestamp header if present (ArrayBuffer with at least 8 bytes + PNG signature)
+        if (data instanceof ArrayBuffer && data.byteLength > 16) {
+            const view = new DataView(data);
+
+            // Read 8-byte little-endian timestamp
+            // JavaScript bitwise ops are 32-bit, so we need to handle this carefully
+            const lo = view.getUint32(0, true);  // little-endian
+            const hi = view.getUint32(4, true);
+            serverTimestamp = lo + hi * 0x100000000;  // Combine into 64-bit value
+
+            // PNG data starts after 8-byte header
+            pngData = data.slice(8);
+
+            // Clock synchronization on first frame (same approach as mouse input)
+            if (this.epochOffset === null && serverTimestamp > 0) {
+                // Calculate offset: server_timestamp + offset = browser_time
+                this.epochOffset = receiveTime - serverTimestamp;
+                logger.info('Video latency epoch synced', {
+                    serverTs: serverTimestamp,
+                    browserTs: receiveTime.toFixed(1),
+                    offset: this.epochOffset.toFixed(1)
+                });
+            }
+
+            // Calculate video latency
+            if (this.epochOffset !== null && serverTimestamp > 0) {
+                // Convert server timestamp to browser time and calculate latency
+                const expectedBrowserTime = serverTimestamp + this.epochOffset;
+                const latency = receiveTime - expectedBrowserTime;
+
+                // Sanity check: latency should be positive and reasonable (< 1000ms)
+                if (latency >= 0 && latency < 1000) {
+                    this.latencyTotal += latency;
+                    this.latencySamples++;
+                }
+            }
+        }
+
+        // Create blob from PNG data
+        const blob = pngData instanceof Blob ? pngData : new Blob([pngData], { type: 'image/png' });
 
         createImageBitmap(blob).then(bitmap => {
             // Resize canvas if needed
@@ -286,6 +345,20 @@ class PNGDecoder extends VideoDecoder {
 
             if (this.onFrame) {
                 this.onFrame(this.frameCount);
+            }
+
+            // Log latency stats periodically (every 3 seconds)
+            const now = performance.now();
+            if (now - this.lastLatencyLog > 3000 && this.latencySamples > 0) {
+                const avgLatency = this.latencyTotal / this.latencySamples;
+                logger.info('Video latency', {
+                    avg: avgLatency.toFixed(1) + 'ms',
+                    samples: this.latencySamples
+                });
+                // Reset for next interval
+                this.latencyTotal = 0;
+                this.latencySamples = 0;
+                this.lastLatencyLog = now;
             }
         }).catch(e => {
             logger.error('Failed to decode PNG', { error: e.message });
@@ -982,22 +1055,31 @@ class BasiliskWebRTC {
         });
 
         // Mouse move - only when pointer is locked (relative movement)
+        // Include timestamp for end-to-end latency measurement
         document.addEventListener('mousemove', (e) => {
             if (document.pointerLockElement === displayElement) {
-                this.sendRaw('M' + e.movementX + ',' + e.movementY);
+                const ts = performance.now();
+                this.sendRaw('M' + e.movementX + ',' + e.movementY + ',' + ts.toFixed(1));
             }
         });
 
-        // Mouse buttons
-        displayElement.addEventListener('mousedown', (e) => {
-            e.preventDefault();
-            this.sendRaw('D' + e.button);
-        });
-
-        displayElement.addEventListener('mouseup', (e) => {
-            e.preventDefault();
-            this.sendRaw('U' + e.button);
-        });
+        // Mouse buttons (also on document when pointer locked)
+        const handleMouseDown = (e) => {
+            if (document.pointerLockElement === displayElement) {
+                e.preventDefault();
+                const ts = performance.now();
+                this.sendRaw('D' + e.button + ',' + ts.toFixed(1));
+            }
+        };
+        const handleMouseUp = (e) => {
+            if (document.pointerLockElement === displayElement) {
+                e.preventDefault();
+                const ts = performance.now();
+                this.sendRaw('U' + e.button + ',' + ts.toFixed(1));
+            }
+        };
+        document.addEventListener('mousedown', handleMouseDown);
+        document.addEventListener('mouseup', handleMouseUp);
 
         displayElement.addEventListener('contextmenu', (e) => e.preventDefault());
 
@@ -2080,6 +2162,30 @@ async function pollEmulatorStatus() {
         }
         if (emuPid) {
             emuPid.textContent = 'PID: ' + (data.emulator_pid > 0 ? data.emulator_pid : '-');
+        }
+
+        // Update mouse latency stat (from emulator via server)
+        const mouseLatencyEl = document.getElementById('stat-mouse-latency');
+        if (mouseLatencyEl && data.mouse_latency_ms !== undefined) {
+            if (data.mouse_latency_samples > 0) {
+                mouseLatencyEl.textContent = data.mouse_latency_ms.toFixed(1) + ' ms';
+            } else {
+                mouseLatencyEl.textContent = '-- ms';
+            }
+        }
+
+        // Update video latency stat (from PNGDecoder)
+        const videoLatencyEl = document.getElementById('stat-video-latency');
+        if (videoLatencyEl && client && client.decoder) {
+            const decoder = client.decoder;
+            if (decoder.getAverageLatency) {
+                const avgLatency = decoder.getAverageLatency();
+                if (avgLatency > 0) {
+                    videoLatencyEl.textContent = avgLatency.toFixed(1) + ' ms';
+                } else {
+                    videoLatencyEl.textContent = '-- ms';
+                }
+            }
         }
     } catch (e) {
         // Silently fail status polling
