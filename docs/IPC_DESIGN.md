@@ -16,98 +16,197 @@ Architecture for the standalone WebRTC server that communicates with BasiliskII/
 
 ## Implementation Status
 
-- ✅ Shared memory for video frames (triple-buffered)
-- ✅ Shared memory for audio (ring buffer)
+- ✅ Shared memory for video frames (triple-buffered I420)
 - ✅ Unix domain socket for input/control
-- ✅ Standalone WebRTC server
+- ✅ Standalone WebRTC server with H.264 encoding
 - ✅ IPC video driver for emulator
-- ✅ Web configuration UI
+- ✅ Automatic emulator discovery and connection
 
-## IPC Mechanisms
+## IPC Protocol Version
 
-### Video Frames: POSIX Shared Memory
+Current version: **v3** (emulator-owned resources)
+
+The emulator owns the shared memory and socket. The server discovers running emulators by scanning `/dev/shm/macemu-video-*` and connects to them.
+
+## Shared Memory: Video Frames
 
 **Location**: `/dev/shm/macemu-video-{pid}`
 
-High-bandwidth video (~57 MB/s at 800×600×4×30fps) uses shared memory for zero-copy transfer.
+The emulator creates a POSIX shared memory segment for video frames. The format is I420 (YUV 4:2:0), already converted from the Mac framebuffer format.
 
-```cpp
+### Structure
+
+```c
+#define MACEMU_VIDEO_MAGIC      0x4D454D55  // "MEMU"
+#define MACEMU_IPC_VERSION      3
+#define MACEMU_MAX_WIDTH        1920
+#define MACEMU_MAX_HEIGHT       1200
+#define MACEMU_I420_Y_SIZE      (MACEMU_MAX_WIDTH * MACEMU_MAX_HEIGHT)
+#define MACEMU_I420_UV_SIZE     (MACEMU_MAX_WIDTH * MACEMU_MAX_HEIGHT / 4)
+#define MACEMU_I420_FRAME_SIZE  (MACEMU_I420_Y_SIZE + MACEMU_I420_UV_SIZE * 2)
+
 struct MacEmuVideoBuffer {
+    // Header (64 bytes, cache-line aligned)
     uint32_t magic;           // MACEMU_VIDEO_MAGIC
-    uint32_t version;         // MACEMU_IPC_VERSION (1)
-    uint32_t width;           // Frame width
-    uint32_t height;          // Frame height
-    uint32_t stride;          // Bytes per row (width * 4)
-    uint32_t format;          // 0 = RGBA
-    std::atomic<uint32_t> write_index;   // Triple buffer index (0-2)
-    std::atomic<uint64_t> frame_count;   // Total frames written
-    uint8_t frames[3][MAX_FRAME_SIZE];   // Triple-buffered RGBA
+    uint32_t version;         // MACEMU_IPC_VERSION (3)
+    uint32_t owner_pid;       // Emulator's PID
+    uint32_t width;           // Current frame width
+    uint32_t height;          // Current frame height
+    uint32_t state;           // Connection state
+    uint32_t reserved[2];     // Future use
+
+    // Atomic state (separate cache line)
+    uint64_t frame_count;     // Total frames written (atomic)
+    uint32_t write_index;     // Current write buffer 0-2 (atomic)
+    uint32_t read_index;      // Current read buffer 0-2 (atomic)
+    uint32_t padding[12];
+
+    // Triple-buffered I420 frames
+    // Each buffer: Y plane (MAX_WIDTH * MAX_HEIGHT) +
+    //              U plane (MAX_WIDTH/2 * MAX_HEIGHT/2) +
+    //              V plane (MAX_WIDTH/2 * MAX_HEIGHT/2)
+    uint8_t buffers[3][MACEMU_I420_FRAME_SIZE];
 };
 ```
 
-**Triple Buffering Protocol**:
-1. Emulator writes to `(write_index + 1) % 3`
-2. After write, atomically updates `write_index`
-3. Server reads from `write_index`
-4. Lock-free, no tearing, no blocking
+### Triple Buffering Protocol
 
-### Audio: Shared Memory Ring Buffer
+Lock-free producer/consumer with three buffers:
 
-**Location**: `/dev/shm/macemu-audio-{pid}`
+1. **Emulator (producer)**:
+   - Gets next write buffer: `next = (write_index + 1) % 3`
+   - Skips if `next == read_index` (server still reading)
+   - Writes I420 frame to buffer
+   - Atomically updates `write_index = next`
+   - Increments `frame_count`
 
-```cpp
-struct MacEmuAudioBuffer {
-    uint32_t magic;           // MACEMU_AUDIO_MAGIC
-    uint32_t version;         // MACEMU_IPC_VERSION
-    uint32_t sample_rate;     // e.g., 44100
-    uint32_t channels;        // 1 or 2
-    uint32_t format;          // 0=S16LE
-    uint32_t buffer_size;     // Ring buffer size
-    std::atomic<uint32_t> write_pos;
-    std::atomic<uint32_t> read_pos;
-    uint8_t ring_buffer[65536];
-};
+2. **Server (consumer)**:
+   - Reads `write_index` to find latest complete frame
+   - Sets `read_index` to claim buffer
+   - Reads I420 data
+   - No blocking, no tearing
+
+### I420 Frame Layout
+
+Each buffer contains planar YUV 4:2:0:
+
+```
+Offset 0:                    Y plane  (stride = MACEMU_MAX_WIDTH)
+Offset Y_SIZE:               U plane  (stride = MACEMU_MAX_WIDTH / 2)
+Offset Y_SIZE + UV_SIZE:     V plane  (stride = MACEMU_MAX_WIDTH / 2)
 ```
 
-### Input/Control: Unix Domain Socket
+The actual frame dimensions may be smaller than the maximum. Use `width` and `height` from the header, but `MACEMU_MAX_WIDTH` for stride calculations.
+
+## Unix Socket: Input and Control
 
 **Location**: `/tmp/macemu-{pid}.sock`
 
-Bidirectional JSON messages over Unix socket.
+The emulator creates a Unix stream socket for bidirectional communication. The server connects when it discovers the emulator.
 
-#### Server → Emulator
+### Binary Protocol
 
-```json
-{"type": "mouse", "x": 100, "y": 200, "buttons": 1}
-{"type": "key", "code": 65, "down": true}
-{"type": "restart"}
+All messages are fixed-size 8-byte structures for simplicity and performance.
+
+#### Input Messages (Server → Emulator)
+
+```c
+// Message types
+#define MACEMU_INPUT_MOUSE  1
+#define MACEMU_INPUT_KEY    2
+#define MACEMU_CMD_RESET    10
+#define MACEMU_CMD_QUIT     11
+#define MACEMU_CMD_STOP     12
+
+// Mouse input (8 bytes)
+struct MacEmuMouseInput {
+    uint8_t type;           // MACEMU_INPUT_MOUSE
+    uint8_t flags;          // Reserved
+    int16_t x;              // Absolute X coordinate
+    int16_t y;              // Absolute Y coordinate
+    uint8_t buttons;        // Button state bitmask (bit 0=left, 1=right, 2=middle)
+    uint8_t reserved;
+};
+
+// Key input (8 bytes)
+struct MacEmuKeyInput {
+    uint8_t type;           // MACEMU_INPUT_KEY
+    uint8_t flags;          // KEY_FLAG_DOWN (1) or KEY_FLAG_UP (2)
+    uint8_t mac_keycode;    // ADB keycode
+    uint8_t modifiers;      // Modifier state
+    uint32_t reserved;
+};
+
+// Command (8 bytes)
+struct MacEmuCommand {
+    uint8_t type;           // MACEMU_CMD_*
+    uint8_t reserved[7];
+};
 ```
 
-#### Emulator → Server
+#### Key Flags
 
-```json
-{"type": "resolution", "width": 800, "height": 600}
-{"type": "ack"}
+```c
+#define KEY_FLAG_DOWN  1
+#define KEY_FLAG_UP    2
 ```
 
-## File Structure
+### WebRTC DataChannel Protocol
+
+The web client sends text messages over DataChannel:
+
+| Message | Format | Description |
+|---------|--------|-------------|
+| Mouse move | `M{dx},{dy}` | Relative mouse movement |
+| Mouse down | `D{button}` | Button pressed (0=left, 1=middle, 2=right) |
+| Mouse up | `U{button}` | Button released |
+| Key down | `K{keycode}` | Key pressed (browser keycode) |
+| Key up | `k{keycode}` | Key released |
+
+The server converts browser keycodes to Mac ADB scancodes.
+
+## Color Space Conversion
+
+The emulator converts the Mac framebuffer to I420 before writing to shared memory. This is done using libyuv for SIMD acceleration.
+
+### Supported Formats
+
+| Mac Format | Description | Conversion |
+|------------|-------------|------------|
+| 32-bit | Big-endian ARGB | `BGRAToI420` |
+| 16-bit | Big-endian RGB555 | Manual byte-swap + `ARGBToI420` |
+| 8-bit | Indexed (256 colors) | Palette lookup + `ARGBToI420` |
+| 4-bit | Indexed (16 colors) | Palette lookup + `ARGBToI420` |
+| 2-bit | Indexed (4 colors) | Palette lookup + `ARGBToI420` |
+| 1-bit | Indexed (B&W) | Palette lookup + `ARGBToI420` |
+
+### 32-bit Format Note
+
+Mac 32-bit is big-endian ARGB, which means bytes in memory are: A, R, G, B.
+
+libyuv's `BGRAToI420` expects this exact memory layout (despite the confusing name - BGRA refers to the little-endian register representation).
+
+## Server Architecture
 
 ```
-web-streaming/
-├── server/
-│   ├── standalone_server.cpp   # Main server (WebRTC, HTTP, IPC)
-│   └── ipc_protocol.h          # Shared memory structures
-├── client/
-│   ├── index_datachannel.html  # Web UI
-│   ├── datachannel_client.js   # WebRTC client
-│   └── styles.css              # Styling
-├── storage/
-│   ├── roms/                   # ROM files
-│   └── images/                 # Disk images
-└── Makefile
-
-BasiliskII/src/IPC/
-└── video_ipc.cpp               # IPC video driver
+┌─────────────────────────────────────────────────────────────┐
+│                    WebRTC Server                             │
+│  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐   │
+│  │ HTTP Server   │  │ WS Signaling  │  │ Emulator Mgr  │   │
+│  │ (port 8000)   │  │ (port 8090)   │  │ (auto-start)  │   │
+│  └───────────────┘  └───────────────┘  └───────────────┘   │
+│           │                 │                  │             │
+│           ▼                 ▼                  ▼             │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │                    Main Loop                         │   │
+│  │  - Scan for emulators (SHM discovery)               │   │
+│  │  - Read I420 frames from SHM                         │   │
+│  │  - Apply blur filter (optional, for dithered modes) │   │
+│  │  - Encode H.264 with OpenH264                        │   │
+│  │  - Send via WebRTC (libdatachannel)                 │   │
+│  │  - Forward input from DataChannel to Unix socket    │   │
+│  └─────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ## Building
@@ -119,7 +218,7 @@ cd web-streaming
 make
 ```
 
-Dependencies: libdatachannel, libvpx
+Dependencies: libdatachannel (built as submodule), OpenH264, libyuv, OpenSSL
 
 ### Emulator with IPC
 
@@ -135,26 +234,34 @@ make
 
 ```bash
 cd web-streaming
-./server/standalone_server --emulator ../BasiliskII/src/Unix/BasiliskII
+./build/macemu-webrtc
 ```
 
-Server auto-starts emulator, manages lifecycle, restarts on crash.
+Server auto-discovers emulator in PATH, starts it, manages lifecycle.
 
 ### Option 2: Manual startup
 
 Terminal 1:
 ```bash
-./server/standalone_server --no-auto-start
+cd web-streaming
+./build/macemu-webrtc --no-auto-start
 ```
 
 Terminal 2:
 ```bash
-MACEMU_VIDEO_SHM=/macemu-video-{pid} \
-MACEMU_CONTROL_SOCK=/tmp/macemu-{pid}.sock \
-./BasiliskII --config prefs
+./BasiliskII --config myprefs
+# Emulator creates SHM and socket, server auto-connects
 ```
 
-## Command Line Options
+## Configuration
+
+### Emulator Prefs
+
+```
+screen ipc/640/480    # Use IPC video driver at 640x480
+```
+
+### Server Command Line
 
 | Option | Default | Description |
 |--------|---------|-------------|
@@ -163,38 +270,39 @@ MACEMU_CONTROL_SOCK=/tmp/macemu-{pid}.sock \
 | `-e, --emulator` | auto | Path to emulator executable |
 | `-P, --prefs` | basilisk_ii.prefs | Prefs file path |
 | `-n, --no-auto-start` | false | Don't auto-start emulator |
-| `--roms` | storage/roms | ROM directory |
-| `--images` | storage/images | Disk images directory |
-
-## Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `MACEMU_VIDEO_SHM` | Override video shared memory name |
-| `MACEMU_CONTROL_SOCK` | Override control socket path |
-| `BASILISK_ROMS` | ROM directory |
-| `BASILISK_IMAGES` | Disk images directory |
-
-## Video Pipeline
-
-```
-┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
-│ Emulator │───►│ Shared   │───►│ VP8      │───►│ WebRTC   │
-│ (RGBA)   │    │ Memory   │    │ Encoder  │    │ RTP/UDP  │
-└──────────┘    └──────────┘    └──────────┘    └──────────┘
-                     │
-              Zero-copy transfer
-```
-
-1. Emulator writes RGBA frame to shared memory
-2. Server reads frame, converts RGBA → I420
-3. VP8 encoder compresses frame
-4. RTP packetizer sends over WebRTC data channel
+| `-t, --test-pattern` | false | Generate test pattern (no emulator) |
+| `--pid` | auto | Connect to specific emulator PID |
 
 ## Benefits
 
 1. **Process isolation**: Server can restart without affecting emulator
 2. **Shared codebase**: Same server works with BasiliskII and SheepShaver
 3. **Resource management**: Encoding load is separate from emulation
-4. **Zero-copy video**: Shared memory eliminates frame copies
-5. **Flexible deployment**: Emulator and server can run on different hosts (with network transport)
+4. **Zero-copy video**: I420 written directly to shared memory
+5. **Automatic discovery**: Server finds running emulators automatically
+6. **Clean protocol**: Binary messages, no parsing overhead
+
+## Video Pipeline
+
+```
+┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+│ Emulator │───►│ Shared   │───►│ Blur     │───►│ H.264    │───►│ WebRTC │
+│ (RGB→I420)    │ Memory   │    │ Filter   │    │ Encoder  │    │ RTP    │
+└──────────┘    └──────────┘    └──────────┘    └──────────┘    └────────┘
+      │                                               │
+   libyuv                                        OpenH264
+   conversion                                    ~36KB IDR
+                                                 ~3KB P
+```
+
+1. Emulator converts Mac framebuffer to I420 (libyuv)
+2. Writes I420 to shared memory (triple-buffered)
+3. Server reads I420, applies optional blur
+4. H.264 encoder compresses frame
+5. RTP packetizer sends over WebRTC
+
+## See Also
+
+- [WEBRTC_STREAMING.md](WEBRTC_STREAMING.md) - User-facing documentation
+- [web-streaming/server/ipc_protocol.h](../web-streaming/server/ipc_protocol.h) - Protocol header
+- [BasiliskII/src/IPC/video_ipc.cpp](../BasiliskII/src/IPC/video_ipc.cpp) - Emulator driver
