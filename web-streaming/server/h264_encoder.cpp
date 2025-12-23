@@ -159,6 +159,16 @@ EncodedFrame H264Encoder::encode_i420(const uint8_t* y, const uint8_t* u, const 
         p_count++;
         p_size_total += total_size;
         p_size_count++;
+
+        // Warn about oversized P-frames (>100KB is unusually large for H.264)
+        // This typically happens with high-resolution dithered content where inter-frame
+        // prediction fails catastrophically. Consider using PNG codec instead.
+        if (total_size > 100 * 1024) {
+            fprintf(stderr, "H264: WARNING - P-frame overflow detected! size=%d bytes (%.1f KB)\n",
+                    total_size, total_size / 1024.0f);
+            fprintf(stderr, "H264: This is common with dithered graphics where every pixel changes.\n");
+            fprintf(stderr, "H264: Consider using 'webcodec png' in prefs for dithered content.\n");
+        }
     } else if (info.eFrameType == videoFrameTypeSkip) {
         skip_count++;
     }

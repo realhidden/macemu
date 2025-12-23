@@ -541,11 +541,10 @@ AC_SUBST(STANDALONE_GUI, [$WANT_STANDALONE_GUI])
 
 dnl We use ESD if possible.
 if [[ "x$WANT_ESD" = "xyes" ]]; then
-  AM_PATH_ESD(0.2.8, [
+  dnl AM_PATH_ESD macro may not be available, using manual check instead
+  AC_CHECK_LIB(esd, esd_open_sound, [
     AC_DEFINE(ENABLE_ESD, 1, [Define is using ESD.])
-    CFLAGS="$CFLAGS $ESD_CFLAGS"
-    CXXFLAGS="$CXXFLAGS $ESD_CFLAGS"
-    LIBS="$LIBS $ESD_LIBS"
+    LIBS="$LIBS -lesd"
   ], [
     AC_MSG_WARN([Could not find ESD, disabling ESD support.])
     WANT_ESD=no
@@ -881,6 +880,15 @@ if [[ "x$WANT_IPC_VIDEO" = "xyes" ]]; then
 
   dnl IPC needs -lrt for shm_open
   LIBS="$LIBS -lrt -lpthread"
+
+  dnl Check for libyuv (required for format conversion)
+  AC_CHECK_HEADER(libyuv.h, [], [
+    AC_MSG_ERROR([libyuv.h not found. Please install libyuv development files (e.g., libyuv-dev or libyuv-devel).])
+  ])
+  AC_CHECK_LIB(yuv, I420Copy, [], [
+    AC_MSG_ERROR([libyuv library not found. Please install libyuv.])
+  ])
+  LIBS="$LIBS -lyuv"
 
   dnl Add IPC protocol header include path and IPC source folder
   CPPFLAGS="$CPPFLAGS -I$IPC_PROTO_DIR -I../IPC"

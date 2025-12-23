@@ -179,6 +179,17 @@ static bool create_video_shm() {
     // Initialize header
     macemu_init_video_buffer(video_shm, pid, frame_width, frame_height);
 
+    // Check if eventfd creation failed
+    if (video_shm->frame_ready_eventfd < 0) {
+        fprintf(stderr, "IPC: Failed to initialize video buffer (eventfd creation failed)\n");
+        munmap(video_shm, shm_size);
+        close(video_shm_fd);
+        shm_unlink(shm_name.c_str());
+        video_shm_fd = -1;
+        video_shm = nullptr;
+        return false;
+    }
+
     fprintf(stderr, "IPC: Created video SHM '%s' (%dx%d, %.1f MB)\n",
             shm_name.c_str(), frame_width, frame_height,
             shm_size / (1024.0 * 1024.0));
@@ -238,7 +249,20 @@ static bool create_control_socket() {
 
     // Set non-blocking for accept
     int flags = fcntl(listen_socket, F_GETFL, 0);
-    fcntl(listen_socket, F_SETFL, flags | O_NONBLOCK);
+    if (flags < 0) {
+        fprintf(stderr, "IPC: Failed to get socket flags: %s\n", strerror(errno));
+        close(listen_socket);
+        unlink(socket_path.c_str());
+        listen_socket = -1;
+        return false;
+    }
+    if (fcntl(listen_socket, F_SETFL, flags | O_NONBLOCK) < 0) {
+        fprintf(stderr, "IPC: Failed to set non-blocking mode: %s\n", strerror(errno));
+        close(listen_socket);
+        unlink(socket_path.c_str());
+        listen_socket = -1;
+        return false;
+    }
 
     fprintf(stderr, "IPC: Listening for server on '%s'\n", socket_path.c_str());
     return true;
@@ -430,7 +454,16 @@ static void control_socket_thread() {
             if (fd >= 0) {
                 // Set non-blocking
                 int flags = fcntl(fd, F_GETFL, 0);
-                fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+                if (flags < 0) {
+                    fprintf(stderr, "IPC: Failed to get socket flags: %s\n", strerror(errno));
+                    close(fd);
+                    continue;
+                }
+                if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+                    fprintf(stderr, "IPC: Failed to set non-blocking mode: %s\n", strerror(errno));
+                    close(fd);
+                    continue;
+                }
                 control_socket = fd;
                 fprintf(stderr, "IPC: Server connected\n");
 
