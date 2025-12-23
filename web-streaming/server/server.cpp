@@ -64,9 +64,9 @@ static bool g_auto_start_emulator = true;
 static pid_t g_target_emulator_pid = 0;  // If specified, connect to this PID
 static CodecType g_server_codec = CodecType::PNG;  // Server-side codec preference (default: PNG)
 
-// Debug/verbosity flags
+// Debug/verbosity flags (extern in encoders for cross-module access)
 static bool g_debug_connection = false;  // WebRTC, ICE, signaling logs
-static bool g_debug_mode_switch = false; // Mode/resolution/color depth changes
+bool g_debug_mode_switch = false;        // Mode/resolution/color depth changes (non-static for encoders)
 static bool g_debug_perf = false;        // Performance stats, ping logs
 static bool g_debug_frames = false;      // Save frame dumps to disk (.ppm files)
 
@@ -1658,7 +1658,9 @@ private:
             peer->video_track->setMediaHandler(packetizer);
 
             peer->video_track->onOpen([peer]() {
-                fprintf(stderr, "[WebRTC] Video track OPEN for %s - ready to send frames!\n", peer->id.c_str());
+                if (g_debug_connection) {
+                    fprintf(stderr, "[WebRTC] Video track OPEN for %s - ready to send frames!\n", peer->id.c_str());
+                }
                 peer->ready = true;
                 // Request keyframe so new peer gets a complete picture
                 g_request_keyframe.store(true);
@@ -1707,7 +1709,9 @@ private:
             // Add data channel for input
             peer->data_channel = peer->pc->createDataChannel("input");
             peer->data_channel->onOpen([peer_id = peer->id]() {
-                fprintf(stderr, "[WebRTC] DataChannel OPEN for %s\n", peer_id.c_str());
+                if (g_debug_connection) {
+                    fprintf(stderr, "[WebRTC] DataChannel OPEN for %s\n", peer_id.c_str());
+                }
             });
             peer->data_channel->onMessage([this](auto data) {
                 if (std::holds_alternative<std::string>(data)) {
@@ -1756,7 +1760,9 @@ private:
                 try {
                     peer->pc->setRemoteDescription(rtc::Description(sdp, "answer"));
                     peer->has_remote_description = true;
-                    fprintf(stderr, "[WebRTC] Remote description set for %s\n", peer->id.c_str());
+                    if (g_debug_connection) {
+                        fprintf(stderr, "[WebRTC] Remote description set for %s\n", peer->id.c_str());
+                    }
                 } catch (const std::exception& e) {
                     fprintf(stderr, "[WebRTC] ERROR setting remote description for %s: %s\n",
                             peer->id.c_str(), e.what());

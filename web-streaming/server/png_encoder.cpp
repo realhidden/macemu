@@ -11,6 +11,9 @@
 // libyuv for fast I420 to RGB conversion
 #include <libyuv.h>
 
+// Debug flags (from server.cpp)
+extern bool g_debug_mode_switch;
+
 // Initialize fpng once
 static bool g_fpng_initialized = false;
 
@@ -32,7 +35,9 @@ bool PNGEncoder::init(int width, int height, int fps) {
     // Pre-allocate RGB buffer
     rgb_buffer_.resize(width * height * 3);  // RGB24
 
-    fprintf(stderr, "PNG: Encoder initialized %dx%d (using fpng)\n", width, height);
+    if (g_debug_mode_switch) {
+        fprintf(stderr, "PNG: Encoder initialized %dx%d (using fpng)\n", width, height);
+    }
     return true;
 }
 
@@ -61,16 +66,16 @@ void PNGEncoder::i420_to_rgb(const uint8_t* y, const uint8_t* u, const uint8_t* 
 bool PNGEncoder::encode_rgb_to_png(int width, int height) {
     png_buffer_.clear();
 
-    // fpng_encode_image_to_memory with FPNG_ENCODE_SLOWER flag
-    // This gives ~6% smaller files at ~40% slower encoding speed
-    // Still much faster than libpng, and smaller files = less bandwidth
+    // fpng_encode_image_to_memory - using default fast mode for lowest latency
+    // FPNG_ENCODE_SLOWER was 40% slower (~104ms) for only 6% size reduction
+    // For localhost/LAN, speed >> compression ratio
     bool success = fpng::fpng_encode_image_to_memory(
         rgb_buffer_.data(),
         width,
         height,
         3,  // num_chans: RGB
         png_buffer_,
-        fpng::FPNG_ENCODE_SLOWER  // Better compression
+        0  // Default fast mode - much lower latency
     );
 
     if (!success) {
@@ -190,6 +195,56 @@ EncodedFrame PNGEncoder::encode_argb(const uint8_t* argb, int width, int height,
 
     // Encode to PNG using fpng
     if (!encode_rgb_to_png(width, height)) {
+        return result;
+    }
+
+    result.data = std::move(png_buffer_);
+    png_buffer_.clear();
+
+    frame_count_++;
+    total_size_ += result.data.size();
+
+    return result;
+}
+
+EncodedFrame PNGEncoder::encode_bgra_rect(const uint8_t* bgra, int frame_width, int frame_height, int stride,
+                                           int rect_x, int rect_y, int rect_width, int rect_height) {
+    EncodedFrame result;
+    result.codec = CodecType::PNG;
+    result.width = rect_width;
+    result.height = rect_height;
+    result.is_keyframe = true;
+
+    // Allocate RGB buffer for the rectangle
+    std::vector<uint8_t> rect_rgb(rect_width * rect_height * 3);
+
+    // Extract and convert the rectangle from BGRA to RGB
+    for (int y = 0; y < rect_height; y++) {
+        const uint8_t* src_row = bgra + (rect_y + y) * stride + rect_x * 4;
+        uint8_t* dst_row = rect_rgb.data() + y * rect_width * 3;
+
+        for (int x = 0; x < rect_width; x++) {
+            // BGRA = bytes B,G,R,A at offsets 0,1,2,3
+            // RGB = bytes R,G,B
+            dst_row[x * 3 + 0] = src_row[x * 4 + 2];  // R
+            dst_row[x * 3 + 1] = src_row[x * 4 + 1];  // G
+            dst_row[x * 3 + 2] = src_row[x * 4 + 0];  // B
+        }
+    }
+
+    // Encode the rectangle to PNG using fast mode
+    png_buffer_.clear();
+    bool success = fpng::fpng_encode_image_to_memory(
+        rect_rgb.data(),
+        rect_width,
+        rect_height,
+        3,  // RGB
+        png_buffer_,
+        0  // Fast mode for low latency
+    );
+
+    if (!success) {
+        fprintf(stderr, "PNG: fpng encode_rect failed\n");
         return result;
     }
 

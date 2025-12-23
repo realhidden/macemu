@@ -481,7 +481,9 @@ class PNGDecoder extends VideoDecoder {
                 if (this.canvas.width !== frameWidth || this.canvas.height !== frameHeight) {
                     this.canvas.width = frameWidth;
                     this.canvas.height = frameHeight;
-                    logger.info('Canvas resized', { width: frameWidth, height: frameHeight });
+                    if (debugConfig.debug_mode_switch) {
+                        logger.info('Canvas resized', { width: frameWidth, height: frameHeight });
+                    }
                 }
             }
 
@@ -503,7 +505,9 @@ class PNGDecoder extends VideoDecoder {
                 this.lastAverageLatency = avgDecode;  // Save for stats panel
 
                 // Log decode latency (brief, on same line as other stats)
-                logger.info(`Decode latency: ${avgDecode.toFixed(1)}ms (${this.latencySamples} samples)`);
+                if (debugConfig.debug_perf) {
+                    logger.info(`Decode latency: ${avgDecode.toFixed(1)}ms (${this.latencySamples} samples)`);
+                }
 
                 // Reset for next interval
                 this.decodeLatencyTotal = 0;
@@ -565,11 +569,13 @@ class PNGDecoder extends VideoDecoder {
         // Log RTT for EVERY ping (not just every 3 seconds)
         // This helps detect skipped pings and shows real-time latency
         const avgRtt = this.rttSamples > 0 ? this.rttTotal / this.rttSamples : total_rtt_ms;
-        const rttLog = `Ping #${sequence} RTT ${total_rtt_ms.toFixed(1)}ms: ` +
-                      `net=${network_ms.toFixed(1)}ms ipc=${ipc_latency_ms.toFixed(1)}ms ` +
-                      `wait=${frame_wait_ms.toFixed(1)}ms enc=${encode_send_ms.toFixed(1)}ms | ` +
-                      `avg=${avgRtt.toFixed(1)}ms (${this.rttSamples})`;
-        logger.info(rttLog);
+        if (debugConfig.debug_perf) {
+            const rttLog = `Ping #${sequence} RTT ${total_rtt_ms.toFixed(1)}ms: ` +
+                          `net=${network_ms.toFixed(1)}ms ipc=${ipc_latency_ms.toFixed(1)}ms ` +
+                          `wait=${frame_wait_ms.toFixed(1)}ms enc=${encode_send_ms.toFixed(1)}ms | ` +
+                          `avg=${avgRtt.toFixed(1)}ms (${this.rttSamples})`;
+            logger.info(rttLog);
+        }
 
         // Reset averaging every 10 pings to keep running average current
         if (this.rttSamples >= 10) {
@@ -942,7 +948,7 @@ class BasiliskWebRTC {
             // Debug: check SDP has ICE credentials
             if (!finalAnswer.sdp.includes('a=ice-ufrag:')) {
                 logger.error('Answer SDP missing ice-ufrag!', { sdp: finalAnswer.sdp });
-            } else {
+            } else if (debugConfig.debug_connection) {
                 logger.info('Answer SDP has ICE credentials');
             }
 
@@ -979,7 +985,9 @@ class BasiliskWebRTC {
             // Timeout after 5 seconds - send what we have
             setTimeout(() => {
                 this.pc.removeEventListener('icegatheringstatechange', checkState);
-                logger.warn('ICE gathering timeout, sending answer with available candidates');
+                if (debugConfig.debug_connection) {
+                    logger.warn('ICE gathering timeout, sending answer with available candidates');
+                }
                 resolve();
             }, 5000);
         });
@@ -1127,10 +1135,12 @@ class BasiliskWebRTC {
                 if (!this.firstFrameReceived) {
                     this.firstFrameReceived = true;
                     connectionSteps.setDone('frames');
-                    logger.info('First frame received!', {
-                        width: this.video.videoWidth,
-                        height: this.video.videoHeight
-                    });
+                    if (debugConfig.debug_connection) {
+                        logger.info('First frame received!', {
+                            width: this.video.videoWidth,
+                            height: this.video.videoHeight
+                        });
+                    }
 
                     // Check if video appears black
                     this.checkForBlackScreen();
@@ -1179,7 +1189,9 @@ class BasiliskWebRTC {
     }
 
     onDataChannel(event) {
-        logger.info('Data channel received', { label: event.channel.label });
+        if (debugConfig.debug_connection) {
+            logger.info('Data channel received', { label: event.channel.label });
+        }
         this.dataChannel = event.channel;
         this.setupDataChannel();
     }
@@ -1247,7 +1259,9 @@ class BasiliskWebRTC {
         this.dataChannel.binaryType = 'arraybuffer';
 
         this.dataChannel.onopen = () => {
-            logger.info('Data channel open');
+            if (debugConfig.debug_connection) {
+                logger.info('Data channel open');
+            }
             this.updateWebRTCState('dc', 'Open');
             this.setupInputHandlers();
             this.startPingTimer();
@@ -1280,7 +1294,9 @@ class BasiliskWebRTC {
                     if (!this.firstFrameReceived) {
                         this.firstFrameReceived = true;
                         connectionSteps.setDone('frames');
-                        logger.info('First frame received via DataChannel');
+                        if (debugConfig.debug_connection) {
+                            logger.info('First frame received via DataChannel');
+                        }
 
                         // For PNG/RAW codecs, mark as connected and hide overlay
                         this.connected = true;
@@ -1352,7 +1368,9 @@ class BasiliskWebRTC {
             this.sendRaw('k' + e.keyCode);
         });
 
-        logger.info('Input handlers registered (pointer lock mode)', { element: displayElement.tagName });
+        if (debugConfig.debug_connection) {
+            logger.info('Input handlers registered (pointer lock mode)', { element: displayElement.tagName });
+        }
     }
 
     // Send raw text message (simple protocol: M dx,dy | D btn | U btn | K code | k code)
@@ -1471,7 +1489,7 @@ class BasiliskWebRTC {
                 this.stats.codec = this.codecType;
 
                 // Log detailed stats every 3 seconds
-                if (!this.lastDetailedStatsTime || (now - this.lastDetailedStatsTime) > 3000) {
+                if (debugConfig.debug_perf && (!this.lastDetailedStatsTime || (now - this.lastDetailedStatsTime) > 3000)) {
                     const avgFrameKB = Math.round(this.pngStats.avgFrameSize / 1024);
                     const totalMB = (this.pngStats.bytesReceived / (1024 * 1024)).toFixed(1);
                     logger.info(`fps=${this.stats.fps} | video: frames=${this.pngStats.framesReceived} recv=${totalMB}MB avg=${avgFrameKB}KB | bitrate: ${this.stats.bitrate}kbps`);

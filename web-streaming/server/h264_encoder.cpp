@@ -6,6 +6,9 @@
 #include <cstdio>
 #include <libyuv.h>
 
+// Debug flags (from server.cpp)
+extern bool g_debug_mode_switch;
+
 bool H264Encoder::init(int width, int height, int fps) {
     return init_internal(width, height, fps, 2000);
 }
@@ -75,8 +78,10 @@ bool H264Encoder::init_internal(int width, int height, int fps, int bitrate_kbps
     height_ = height;
     fps_ = fps;
 
-    fprintf(stderr, "H264: Encoder initialized %dx%d @ %d kbps\n",
-            width, height, bitrate_kbps);
+    if (g_debug_mode_switch) {
+        fprintf(stderr, "H264: Encoder initialized %dx%d @ %d kbps\n",
+                width, height, bitrate_kbps);
+    }
     return true;
 }
 
