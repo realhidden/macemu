@@ -1750,12 +1750,13 @@ private:
                     if (g_debug_connection) {
                         static int msg_count = 0;
                         if (msg_count++ < 5) {
-                            fprintf(stderr, "[WebRTC] DataChannel message: '%s'\n", msg.c_str());
+                            fprintf(stderr, "[WebRTC] DataChannel text message: '%s'\n", msg.c_str());
                         }
                     }
-                    handle_input(msg);
-                } else if (g_debug_connection) {
-                    fprintf(stderr, "[WebRTC] DataChannel received binary data\n");
+                    handle_input_text(msg);
+                } else if (std::holds_alternative<rtc::binary>(data)) {
+                    const rtc::binary& bin = std::get<rtc::binary>(data);
+                    handle_input_binary(reinterpret_cast<const uint8_t*>(bin.data()), bin.size());
                 }
             });
 
@@ -1769,7 +1770,10 @@ private:
                 });
                 dc->onMessage([this](auto data) {
                     if (std::holds_alternative<std::string>(data)) {
-                        handle_input(std::get<std::string>(data));
+                        handle_input_text(std::get<std::string>(data));
+                    } else if (std::holds_alternative<rtc::binary>(data)) {
+                        const rtc::binary& bin = std::get<rtc::binary>(data);
+                        handle_input_binary(reinterpret_cast<const uint8_t*>(bin.data()), bin.size());
                     }
                 });
             });
@@ -1844,7 +1848,77 @@ private:
         }
     }
 
-    void handle_input(const std::string& msg) {
+    // Binary input protocol handler (new, optimized)
+    // Format from browser:
+    // Mouse move: [type=1:1] [dx:int16] [dy:int16] [timestamp:float64]
+    // Mouse button: [type=2:1] [button:uint8] [down:uint8] [timestamp:float64]
+    // Key: [type=3:1] [keycode:uint16] [down:uint8] [timestamp:float64]
+    // Ping: [type=4:1] [sequence:uint32] [timestamp:float64]
+    void handle_input_binary(const uint8_t* data, size_t len) {
+        if (len < 1) return;
+
+        uint8_t type = data[0];
+        static uint8_t current_buttons = 0;
+
+        switch (type) {
+            case 1: {  // Mouse move
+                if (len < 13) return;  // 1 + 2 + 2 + 8
+                int16_t dx = *reinterpret_cast<const int16_t*>(data + 1);
+                int16_t dy = *reinterpret_cast<const int16_t*>(data + 3);
+                double timestamp = *reinterpret_cast<const double*>(data + 5);
+                uint64_t browser_ts = static_cast<uint64_t>(timestamp);
+                send_mouse_input(dx, dy, current_buttons, browser_ts);
+                g_mouse_move_count++;
+                break;
+            }
+            case 2: {  // Mouse button
+                if (len < 11) return;  // 1 + 1 + 1 + 8
+                uint8_t button = data[1];
+                uint8_t down = data[2];
+                double timestamp = *reinterpret_cast<const double*>(data + 3);
+                uint64_t browser_ts = static_cast<uint64_t>(timestamp);
+
+                if (down) {
+                    if (button == 0) current_buttons |= MACEMU_MOUSE_LEFT;
+                    else if (button == 1) current_buttons |= MACEMU_MOUSE_MIDDLE;
+                    else if (button == 2) current_buttons |= MACEMU_MOUSE_RIGHT;
+                } else {
+                    if (button == 0) current_buttons &= ~MACEMU_MOUSE_LEFT;
+                    else if (button == 1) current_buttons &= ~MACEMU_MOUSE_MIDDLE;
+                    else if (button == 2) current_buttons &= ~MACEMU_MOUSE_RIGHT;
+                }
+                send_mouse_input(0, 0, current_buttons, browser_ts);
+                g_mouse_click_count++;
+                break;
+            }
+            case 3: {  // Key
+                if (len < 12) return;  // 1 + 2 + 1 + 8
+                uint16_t keycode = *reinterpret_cast<const uint16_t*>(data + 1);
+                uint8_t down = data[3];
+                int mac_code = browser_to_mac_keycode(keycode);
+                if (mac_code >= 0) {
+                    send_key_input(mac_code, down != 0);
+                    g_key_count++;
+                }
+                break;
+            }
+            case 4: {  // Ping
+                if (len < 13) return;  // 1 + 4 + 8
+                uint32_t sequence = *reinterpret_cast<const uint32_t*>(data + 1);
+                double timestamp = *reinterpret_cast<const double*>(data + 5);
+                uint64_t timestamp_ms = static_cast<uint64_t>(timestamp);
+                bool success = send_ping_input(sequence, timestamp_ms);
+                if (g_debug_perf) {
+                    fprintf(stderr, "[Server] Binary ping #%u (t1=%.1fms) forwarded to emulator: %s\n",
+                            sequence, timestamp, success ? "OK" : "FAILED");
+                }
+                break;
+            }
+        }
+    }
+
+    // Text input protocol handler (legacy fallback)
+    void handle_input_text(const std::string& msg) {
         // Simple text protocol from browser: M dx,dy | D btn | U btn | K code | k code
         // Server converts browser keycodes to Mac keycodes and sends binary to emulator
         if (msg.empty()) return;

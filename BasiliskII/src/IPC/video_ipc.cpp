@@ -126,11 +126,6 @@ static uint32_t ping_echo_frames_remaining = 0;  // How many more frames to echo
 static std::thread control_thread;
 static std::atomic<bool> control_thread_running(false);
 
-// Mouse state (relative mode)
-static std::atomic<int> mouse_delta_x(0);
-static std::atomic<int> mouse_delta_y(0);
-static std::atomic<bool> pending_mouse_update(false);
-
 // Mouse latency tracking (browser timestamp → emulator receive)
 static std::atomic<uint64_t> mouse_latency_total_ms(0);
 static std::atomic<int> mouse_latency_samples(0);
@@ -307,10 +302,12 @@ static void process_binary_input(const uint8_t* data, size_t len) {
                 }
             }
 
-            // Accumulate mouse deltas
-            mouse_delta_x.fetch_add(mouse->x);
-            mouse_delta_y.fetch_add(mouse->y);
-            pending_mouse_update.store(true);
+            // Call ADBMouseMoved() immediately (like X11 driver does)
+            // ADB handles its own buffering - no need to batch here
+            if (mouse->x != 0 || mouse->y != 0) {
+                ADBMouseMoved(mouse->x, mouse->y);
+            }
+
             // Handle button changes
             static uint8_t last_buttons = 0;
             uint8_t changed = mouse->buttons ^ last_buttons;
@@ -729,9 +726,8 @@ static void video_refresh_thread()
 {
     auto last_frame_time = std::chrono::steady_clock::now();
     auto last_stats_time = std::chrono::steady_clock::now();
-    int target_fps = 30;
+    int target_fps = 60;  // Increased from 30 to 60 FPS for lower latency
     int frames_sent = 0;
-    int mouse_updates = 0;
 
     // Dirty rect statistics
     uint64_t total_full_pixels = 0;   // Total pixels if all frames were full
@@ -743,16 +739,6 @@ static void video_refresh_thread()
     while (video_thread_running) {
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_frame_time);
-
-        // Process pending mouse delta updates (relative mode)
-        if (pending_mouse_update.exchange(false)) {
-            int dx = mouse_delta_x.exchange(0);
-            int dy = mouse_delta_y.exchange(0);
-            if (dx != 0 || dy != 0) {
-                ADBMouseMoved(dx, dy);
-                mouse_updates++;
-            }
-        }
 
         // Print stats every 3 seconds
         auto stats_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_stats_time);
@@ -780,15 +766,14 @@ static void video_refresh_thread()
 
             static bool debug_perf = (getenv("MACEMU_DEBUG_PERF") != nullptr);
             if (debug_perf) {
-                fprintf(stderr, "[Emulator] fps=%.1f frames=%d | mouse: events=%d latency=%.1fms | dirty: rects=%d full=%d skip=%d saved=%.0f%% | server=%s\n",
+                fprintf(stderr, "[Emulator] fps=%.1f frames=%d | mouse: latency=%.1fms | dirty: rects=%d full=%d skip=%d saved=%.0f%% | server=%s\n",
                         fps, frames_sent,
-                        mouse_updates, avg_mouse_ms,
+                        avg_mouse_ms,
                         dirty_rect_frames, full_frames, skipped_frames, bandwidth_saved_pct,
                         control_socket >= 0 ? "connected" : "waiting");
             }
 
             frames_sent = 0;
-            mouse_updates = 0;
             dirty_rect_frames = 0;
             full_frames = 0;
             skipped_frames = 0;

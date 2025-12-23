@@ -592,8 +592,14 @@ class PNGDecoder extends VideoDecoder {
 
         this.pingSequence++;
         const timestamp = performance.now();
-        const msg = `P${this.pingSequence},${timestamp}`;
-        dataChannel.send(msg);
+
+        // Binary ping protocol: [type=4:1] [sequence:uint32] [timestamp:float64]
+        const buffer = new ArrayBuffer(1 + 4 + 8);
+        const view = new DataView(buffer);
+        view.setUint8(0, 4);  // type: ping
+        view.setUint32(1, this.pingSequence, true);  // little-endian
+        view.setFloat64(5, timestamp, true);
+        dataChannel.send(buffer);
     }
 }
 
@@ -1326,10 +1332,10 @@ class BasiliskWebRTC {
 
         // Mouse move - only when pointer is locked (relative movement)
         // Include timestamp for end-to-end latency measurement
+        // Binary protocol for minimal latency
         document.addEventListener('mousemove', (e) => {
             if (document.pointerLockElement === displayElement) {
-                const ts = performance.now();
-                this.sendRaw('M' + e.movementX + ',' + e.movementY + ',' + ts.toFixed(1));
+                this.sendMouseMove(e.movementX, e.movementY, performance.now());
             }
         });
 
@@ -1337,15 +1343,13 @@ class BasiliskWebRTC {
         const handleMouseDown = (e) => {
             if (document.pointerLockElement === displayElement) {
                 e.preventDefault();
-                const ts = performance.now();
-                this.sendRaw('D' + e.button + ',' + ts.toFixed(1));
+                this.sendMouseButton(e.button, true, performance.now());
             }
         };
         const handleMouseUp = (e) => {
             if (document.pointerLockElement === displayElement) {
                 e.preventDefault();
-                const ts = performance.now();
-                this.sendRaw('U' + e.button + ',' + ts.toFixed(1));
+                this.sendMouseButton(e.button, false, performance.now());
             }
         };
         document.addEventListener('mousedown', handleMouseDown);
@@ -1353,19 +1357,19 @@ class BasiliskWebRTC {
 
         displayElement.addEventListener('contextmenu', (e) => e.preventDefault());
 
-        // Keyboard
+        // Keyboard - binary protocol for minimal latency
         document.addEventListener('keydown', (e) => {
             if (!this.connected) return;
             if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
             e.preventDefault();
-            this.sendRaw('K' + e.keyCode);
+            this.sendKey(e.keyCode, true, performance.now());
         });
 
         document.addEventListener('keyup', (e) => {
             if (!this.connected) return;
             if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
             e.preventDefault();
-            this.sendRaw('k' + e.keyCode);
+            this.sendKey(e.keyCode, false, performance.now());
         });
 
         if (debugConfig.debug_connection) {
@@ -1373,7 +1377,46 @@ class BasiliskWebRTC {
         }
     }
 
-    // Send raw text message (simple protocol: M dx,dy | D btn | U btn | K code | k code)
+    // Binary protocol helpers (matches browser input format sent to server)
+    // Format: [type:1] [data...]
+    // Mouse move: type=1, dx:int16, dy:int16, timestamp:float64
+    // Mouse button: type=2, button:uint8, down:uint8, timestamp:float64
+    // Key: type=3, keycode:uint16, down:uint8, timestamp:float64
+
+    sendMouseMove(dx, dy, timestamp) {
+        if (!this.dataChannel || this.dataChannel.readyState !== 'open') return;
+        const buffer = new ArrayBuffer(1 + 2 + 2 + 8);
+        const view = new DataView(buffer);
+        view.setUint8(0, 1);  // type: mouse move
+        view.setInt16(1, dx, true);  // little-endian
+        view.setInt16(3, dy, true);
+        view.setFloat64(5, timestamp, true);
+        this.dataChannel.send(buffer);
+    }
+
+    sendMouseButton(button, down, timestamp) {
+        if (!this.dataChannel || this.dataChannel.readyState !== 'open') return;
+        const buffer = new ArrayBuffer(1 + 1 + 1 + 8);
+        const view = new DataView(buffer);
+        view.setUint8(0, 2);  // type: mouse button
+        view.setUint8(1, button);
+        view.setUint8(2, down ? 1 : 0);
+        view.setFloat64(3, timestamp, true);
+        this.dataChannel.send(buffer);
+    }
+
+    sendKey(keycode, down, timestamp) {
+        if (!this.dataChannel || this.dataChannel.readyState !== 'open') return;
+        const buffer = new ArrayBuffer(1 + 2 + 1 + 8);
+        const view = new DataView(buffer);
+        view.setUint8(0, 3);  // type: key
+        view.setUint16(1, keycode, true);
+        view.setUint8(3, down ? 1 : 0);
+        view.setFloat64(4, timestamp, true);
+        this.dataChannel.send(buffer);
+    }
+
+    // Send raw text message (legacy text protocol - fallback)
     sendRaw(msg) {
         if (this.dataChannel && this.dataChannel.readyState === 'open') {
             this.dataChannel.send(msg);
