@@ -93,6 +93,9 @@ static std::atomic<uint64_t> g_key_count(0);
 // Global flag to request keyframe (set when new peer connects)
 static std::atomic<bool> g_request_keyframe(false);
 
+// Forward declarations
+class WebRTCServer;
+
 // Signal handler
 static void signal_handler(int sig) {
     fprintf(stderr, "\nServer: Received signal %d, shutting down...\n", sig);
@@ -429,11 +432,8 @@ static bool try_connect_to_emulator(pid_t pid) {
     return true;
 }
 
-static void disconnect_from_emulator() {
-    disconnect_control_socket();
-    disconnect_video_shm();
-    g_emulator_pid = -1;
-}
+// Forward declaration - implementation after WebRTCServer class
+static void disconnect_from_emulator(WebRTCServer* webrtc = nullptr);
 
 
 /*
@@ -1592,6 +1592,16 @@ public:
     int peer_count() { return peer_count_.load(); }
     bool is_enabled() { return initialized_.load(); }
 
+    // Disconnect all peers (e.g., when emulator restarts and resolution changes)
+    void disconnect_all_peers() {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        fprintf(stderr, "[WebRTC] Disconnecting all peers (%d) due to emulator restart\n", (int)peers_.size());
+        // Close all peer connections - this will trigger browser reconnections
+        peers_.clear();
+        ws_to_peer_id_.clear();
+        peer_count_.store(0);
+    }
+
 private:
     void process_signaling(std::shared_ptr<rtc::WebSocket> ws, const std::string& msg) {
         std::string type = json_get_string(msg, "type");
@@ -1923,6 +1933,18 @@ private:
     uint32_t ssrc_ = 1;
 };
 
+// Implementation of disconnect_from_emulator (needs WebRTCServer definition)
+static void disconnect_from_emulator(WebRTCServer* webrtc) {
+    disconnect_control_socket();
+    disconnect_video_shm();
+    g_emulator_pid = -1;
+
+    // Disconnect all WebRTC peers so they reconnect with fresh encoder/decoder instances
+    // This is important when emulator restarts with different resolution
+    if (webrtc) {
+        webrtc->disconnect_all_peers();
+    }
+}
 
 /*
  * Main video processing loop
@@ -1985,7 +2007,7 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
                 // Emulator we started exited - check if restart requested (exit code 75)
                 if (exit_code == 75) {
                     fprintf(stderr, "Video: Auto-restarting emulator...\n");
-                    disconnect_from_emulator();
+                    disconnect_from_emulator(&webrtc);
                     std::this_thread::sleep_for(std::chrono::milliseconds(500));
                     start_emulator();
                 }
@@ -1999,7 +2021,7 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
                 } else {
                     send_command(MACEMU_CMD_RESET);
                 }
-                disconnect_from_emulator();
+                disconnect_from_emulator(&webrtc);
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 if (g_auto_start_emulator) {
                     start_emulator();
@@ -2014,7 +2036,7 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
             if (n == 0) {
                 // Connection closed
                 fprintf(stderr, "Video: Emulator disconnected\n");
-                disconnect_from_emulator();
+                disconnect_from_emulator(&webrtc);
             }
         }
 
@@ -2042,7 +2064,7 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
                 fprintf(stderr, "Video: FATAL: Failed to add eventfd %d to epoll: %s\n",
                         g_frame_ready_eventfd, strerror(errno));
                 // This is fatal - can't proceed without eventfd
-                disconnect_from_emulator();
+                disconnect_from_emulator(&webrtc);
                 continue;
             }
         }
