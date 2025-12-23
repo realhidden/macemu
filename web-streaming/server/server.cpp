@@ -1949,15 +1949,15 @@ private:
 
 // Implementation of disconnect_from_emulator (needs WebRTCServer definition)
 static void disconnect_from_emulator(WebRTCServer* webrtc) {
+    (void)webrtc;  // Keep parameter for future use, suppress unused warning
     disconnect_control_socket();
     disconnect_video_shm();
     g_emulator_pid = -1;
 
-    // Disconnect all WebRTC peers so they reconnect with fresh encoder/decoder instances
-    // This is important when emulator restarts with different resolution
-    if (webrtc) {
-        webrtc->disconnect_all_peers();
-    }
+    // NOTE: We do NOT disconnect WebRTC peers here!
+    // The encoder auto-reinitializes when resolution changes,
+    // and the browser canvas auto-resizes. The video stream
+    // should continue seamlessly across emulator restarts.
 }
 
 /*
