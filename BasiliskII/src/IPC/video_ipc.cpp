@@ -387,6 +387,9 @@ static void process_binary_input(const uint8_t* data, size_t len) {
 static void update_ping_on_frame_complete(uint64_t timestamp_us) {
     if (!video_shm) return;
 
+    // Check debug flag (cached at startup for performance)
+    static bool debug_perf = (getenv("MACEMU_DEBUG_PERF") != nullptr);
+
     // Read current ping sequence (atomic read-acquire ensures we see all timestamp writes)
     uint32_t current_ping_seq = ATOMIC_LOAD(video_shm->ping_sequence);
 
@@ -399,9 +402,11 @@ static void update_ping_on_frame_complete(uint64_t timestamp_us) {
         last_echoed_ping_seq = current_ping_seq;
         ping_echo_frames_remaining = 5;  // Echo in next 5 frames
 
-        // Reduced logging - only log when first setting t4
-        fprintf(stderr, "[Emulator] Ping #%u ready (t4=%llu)\n",
-                current_ping_seq, (unsigned long long)timestamp_us);
+        // Debug logging - only if debug_perf enabled
+        if (debug_perf) {
+            fprintf(stderr, "[Emulator] Ping #%u ready (t4=%llu)\n",
+                    current_ping_seq, (unsigned long long)timestamp_us);
+        }
     } else if (ping_echo_frames_remaining > 0) {
         // Still echoing previous ping - silently decrement counter
         ping_echo_frames_remaining--;
@@ -514,8 +519,8 @@ static void convert_frame_to_bgra() {
     uint32_t height = video_shm->height;
     if (width == 0 || height == 0) return;
 
-    // Get write buffer pointer
-    uint32_t write_idx = ATOMIC_LOAD(video_shm->write_index);
+    // Get write buffer pointer (plain read - we own the write buffer)
+    uint32_t write_idx = video_shm->write_index;
     uint8_t* dst_frame = macemu_get_frame_ptr(video_shm, write_idx);
     int dst_stride = macemu_get_bgra_stride();
 
@@ -620,7 +625,7 @@ static void convert_frame_to_bgra() {
     // write_idx (already loaded above) = buffer we just wrote to
     // ready_index = buffer server is reading (frame N-1)
     // prev_index  = the third buffer (frame N-2), our comparison baseline
-    uint32_t ready_idx = ATOMIC_LOAD(video_shm->ready_index);
+    uint32_t ready_idx = video_shm->ready_index;  // Plain read - we don't race with server
 
     // On first few frames, indices might be the same - always send full frame
     // Once triple buffering is active, all 3 indices will be different
@@ -668,18 +673,19 @@ static void convert_frame_to_bgra() {
     }
 
     // Store dirty rect in SHM for server to read
+    // Plain writes - synchronized by eventfd write in macemu_frame_complete()
     if (!prev_frame) {
         // First frame or can't compare - send full frame
-        ATOMIC_STORE(video_shm->dirty_x, 0);
-        ATOMIC_STORE(video_shm->dirty_y, 0);
-        ATOMIC_STORE(video_shm->dirty_width, width);
-        ATOMIC_STORE(video_shm->dirty_height, height);
+        video_shm->dirty_x = 0;
+        video_shm->dirty_y = 0;
+        video_shm->dirty_width = width;
+        video_shm->dirty_height = height;
     } else if (!found_change) {
         // No changes - signal this with width=0
-        ATOMIC_STORE(video_shm->dirty_x, 0);
-        ATOMIC_STORE(video_shm->dirty_y, 0);
-        ATOMIC_STORE(video_shm->dirty_width, 0);
-        ATOMIC_STORE(video_shm->dirty_height, 0);
+        video_shm->dirty_x = 0;
+        video_shm->dirty_y = 0;
+        video_shm->dirty_width = 0;
+        video_shm->dirty_height = 0;
     } else {
         // Add small 1-pixel margin for safety (PNG filtering artifacts)
         uint32_t dirty_x = (min_x > 1) ? min_x - 1 : 0;
@@ -697,10 +703,10 @@ static void convert_frame_to_bgra() {
             dirty_h = height;
         }
 
-        ATOMIC_STORE(video_shm->dirty_x, dirty_x);
-        ATOMIC_STORE(video_shm->dirty_y, dirty_y);
-        ATOMIC_STORE(video_shm->dirty_width, dirty_w);
-        ATOMIC_STORE(video_shm->dirty_height, dirty_h);
+        video_shm->dirty_x = dirty_x;
+        video_shm->dirty_y = dirty_y;
+        video_shm->dirty_width = dirty_w;
+        video_shm->dirty_height = dirty_h;
     }
 
     // Get timestamp and signal frame complete
@@ -772,11 +778,14 @@ static void video_refresh_thread()
                 bandwidth_saved_pct = 100.0f * (1.0f - (float)total_dirty_pixels / total_full_pixels);
             }
 
-            fprintf(stderr, "[Emulator] fps=%.1f frames=%d | mouse: events=%d latency=%.1fms | dirty: rects=%d full=%d skip=%d saved=%.0f%% | server=%s\n",
-                    fps, frames_sent,
-                    mouse_updates, avg_mouse_ms,
-                    dirty_rect_frames, full_frames, skipped_frames, bandwidth_saved_pct,
-                    control_socket >= 0 ? "connected" : "waiting");
+            static bool debug_perf = (getenv("MACEMU_DEBUG_PERF") != nullptr);
+            if (debug_perf) {
+                fprintf(stderr, "[Emulator] fps=%.1f frames=%d | mouse: events=%d latency=%.1fms | dirty: rects=%d full=%d skip=%d saved=%.0f%% | server=%s\n",
+                        fps, frames_sent,
+                        mouse_updates, avg_mouse_ms,
+                        dirty_rect_frames, full_frames, skipped_frames, bandwidth_saved_pct,
+                        control_socket >= 0 ? "connected" : "waiting");
+            }
 
             frames_sent = 0;
             mouse_updates = 0;
@@ -803,8 +812,8 @@ static void video_refresh_thread()
 
         // Track dirty rect statistics
         if (video_shm) {
-            uint32_t dirty_w = ATOMIC_LOAD(video_shm->dirty_width);
-            uint32_t dirty_h = ATOMIC_LOAD(video_shm->dirty_height);
+            uint32_t dirty_w = video_shm->dirty_width;  // Plain read for stats
+            uint32_t dirty_h = video_shm->dirty_height;
             uint32_t width = video_shm->width;
             uint32_t height = video_shm->height;
 
@@ -881,8 +890,12 @@ void IPC_monitor_desc::switch_to_current_mode(void)
     MacScreenWidth = mode.x;
     MacScreenHeight = mode.y;
 
-    fprintf(stderr, "IPC: Switched to mode %dx%d @ %d bpp (bytes_per_row=%d)\n",
-            mode.x, mode.y, frame_depth, frame_bytes_per_row);
+    // Check debug flag (cached at startup for performance)
+    static bool debug_mode_switch = (getenv("MACEMU_DEBUG_MODE_SWITCH") != nullptr);
+    if (debug_mode_switch) {
+        fprintf(stderr, "IPC: Switched to mode %dx%d @ %d bpp (bytes_per_row=%d)\n",
+                mode.x, mode.y, frame_depth, frame_bytes_per_row);
+    }
 }
 
 
@@ -894,11 +907,15 @@ void IPC_monitor_desc::set_palette(uint8 *pal, int num)
         current_palette[i * 3 + 1] = pal[i * 3 + 1];
         current_palette[i * 3 + 2] = pal[i * 3 + 2];
     }
-    // Log first few palette entries for debugging
-    fprintf(stderr, "IPC: set_palette(%d entries) [0]=(%d,%d,%d) [1]=(%d,%d,%d)\n",
-            num,
-            current_palette[0], current_palette[1], current_palette[2],
-            current_palette[3], current_palette[4], current_palette[5]);
+
+    // Debug logging - only if debug_mode_switch enabled
+    static bool debug_mode_switch = (getenv("MACEMU_DEBUG_MODE_SWITCH") != nullptr);
+    if (debug_mode_switch) {
+        fprintf(stderr, "IPC: set_palette(%d entries) [0]=(%d,%d,%d) [1]=(%d,%d,%d)\n",
+                num,
+                current_palette[0], current_palette[1], current_palette[2],
+                current_palette[3], current_palette[4], current_palette[5]);
+    }
 }
 
 

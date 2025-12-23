@@ -4,6 +4,25 @@
  * Full-featured client with debugging, stats tracking, and connection monitoring.
  */
 
+// Global debug configuration (fetched from server)
+const debugConfig = {
+    debug_connection: false,   // WebRTC/ICE/signaling logs
+    debug_mode_switch: false,  // Mode/resolution/color depth changes
+    debug_perf: false          // Performance stats, ping logs
+};
+
+// Fetch debug config from server
+async function fetchDebugConfig() {
+    try {
+        const response = await fetch('/api/config');
+        const config = await response.json();
+        Object.assign(debugConfig, config);
+        console.log('[Browser] Debug config:', debugConfig);
+    } catch (e) {
+        console.warn('[Browser] Failed to fetch debug config, using defaults');
+    }
+}
+
 // Debug logging system - sends to server and local debug panel
 class DebugLogger {
     constructor() {
@@ -412,9 +431,17 @@ class PNGDecoder extends VideoDecoder {
             // Calculate all latencies if this frame echoes our ping
             // Handle ping echo if present in this frame
             if (pingSeq > 0) {
+                // Check for skipped pings
+                if (this.lastReceivedPingSeq > 0 && pingSeq > this.lastReceivedPingSeq + 1) {
+                    const skipped = pingSeq - this.lastReceivedPingSeq - 1;
+                    logger.warn(`[Ping] WARNING: Skipped ${skipped} ping(s) - jumped from #${this.lastReceivedPingSeq} to #${pingSeq}`);
+                }
+
                 // Only process if this is a NEW ping (not a duplicate from multi-frame echo)
                 if (pingSeq !== this.lastReceivedPingSeq) {
-                    logger.info(`[Ping] New echo #${pingSeq} (browser_send=${ping_browser_send_ms.toFixed(1)}ms)`);
+                    if (debugConfig.debug_perf) {
+                        logger.info(`[Ping] New echo #${pingSeq} (browser_send=${ping_browser_send_ms.toFixed(1)}ms)`);
+                    }
                     this.lastReceivedPingSeq = pingSeq;
 
                     // Process ping echo
@@ -535,23 +562,23 @@ class PNGDecoder extends VideoDecoder {
             timestamp: now
         };
 
-        // Log every 3 seconds
-        if (now - this.lastRttLog >= 3000 && this.rttSamples > 0) {
-            const avgRtt = this.rttTotal / this.rttSamples;
-            this.lastAverageRtt = avgRtt;  // Save for stats panel
+        // Log RTT for EVERY ping (not just every 3 seconds)
+        // This helps detect skipped pings and shows real-time latency
+        const avgRtt = this.rttSamples > 0 ? this.rttTotal / this.rttSamples : total_rtt_ms;
+        const rttLog = `Ping #${sequence} RTT ${total_rtt_ms.toFixed(1)}ms: ` +
+                      `net=${network_ms.toFixed(1)}ms ipc=${ipc_latency_ms.toFixed(1)}ms ` +
+                      `wait=${frame_wait_ms.toFixed(1)}ms enc=${encode_send_ms.toFixed(1)}ms | ` +
+                      `avg=${avgRtt.toFixed(1)}ms (${this.rttSamples})`;
+        logger.info(rttLog);
 
-            // Log RTT breakdown (brief format)
-            const rttLog = `Ping #${sequence} RTT ${total_rtt_ms.toFixed(1)}ms: ` +
-                          `net=${network_ms.toFixed(1)}ms ipc=${ipc_latency_ms.toFixed(1)}ms ` +
-                          `wait=${frame_wait_ms.toFixed(1)}ms enc=${encode_send_ms.toFixed(1)}ms | ` +
-                          `avg=${avgRtt.toFixed(1)}ms (${this.rttSamples})`;
-            logger.info(rttLog);
-
-            // Reset for next interval
+        // Reset averaging every 10 pings to keep running average current
+        if (this.rttSamples >= 10) {
+            this.lastAverageRtt = this.rttTotal / this.rttSamples;  // Save for stats panel
             this.rttTotal = 0;
             this.rttSamples = 0;
-            this.lastRttLog = now;
         }
+
+        this.lastRttLog = now;
     }
 
     sendPing(dataChannel) {
@@ -757,7 +784,9 @@ class BasiliskWebRTC {
             return;
         }
 
-        logger.info('Connecting to signaling server', { url: this.wsUrl, codec: this.codecType });
+        if (debugConfig.debug_connection) {
+            logger.info('Connecting to signaling server', { url: this.wsUrl, codec: this.codecType });
+        }
         this.updateStatus('Connecting...', 'connecting');
         connectionSteps.setActive('ws');
 
@@ -777,7 +806,9 @@ class BasiliskWebRTC {
     }
 
     onWsOpen() {
-        logger.info('WebSocket connected');
+        if (debugConfig.debug_connection) {
+            logger.info('WebSocket connected');
+        }
         connectionSteps.setDone('ws');
         connectionSteps.setActive('offer');
         this.updateStatus('Signaling connected', 'connecting');
@@ -820,7 +851,9 @@ class BasiliskWebRTC {
     async handleSignaling(msg) {
         switch (msg.type) {
             case 'welcome':
-                logger.info('Server acknowledged connection');
+                if (debugConfig.debug_connection) {
+                    logger.info('Server acknowledged connection');
+                }
                 this.updateOverlayStatus('Waiting for video offer...');
                 break;
 
@@ -831,18 +864,24 @@ class BasiliskWebRTC {
                                        msg.codec === 'png' ? CodecType.PNG :
                                        msg.codec === 'raw' ? CodecType.RAW : CodecType.PNG;
                     if (serverCodec !== this.codecType) {
-                        logger.info('Server codec', { codec: msg.codec });
+                        if (debugConfig.debug_connection) {
+                            logger.info('Server codec', { codec: msg.codec });
+                        }
                         this.codecType = serverCodec;
                         // Reinitialize decoder for new codec
                         this.initDecoder();
                     }
                 }
-                logger.info('Server acknowledged connection', { codec: msg.codec, peer_id: msg.peer_id });
+                if (debugConfig.debug_connection) {
+                    logger.info('Server acknowledged connection', { codec: msg.codec, peer_id: msg.peer_id });
+                }
                 this.updateOverlayStatus('Waiting for video offer...');
                 break;
 
             case 'offer':
-                logger.info('Received SDP offer', { sdpLength: msg.sdp.length });
+                if (debugConfig.debug_connection) {
+                    logger.info('Received SDP offer', { sdpLength: msg.sdp.length });
+                }
                 connectionSteps.setDone('offer');
                 connectionSteps.setActive('ice');
                 this.updateOverlayStatus('Processing offer...');
@@ -883,11 +922,15 @@ class BasiliskWebRTC {
         try {
             const offer = new RTCSessionDescription({ type: 'offer', sdp: sdp });
             await this.pc.setRemoteDescription(offer);
-            logger.info('Set remote description (offer)');
+            if (debugConfig.debug_connection) {
+                logger.info('Set remote description (offer)');
+            }
 
             const answer = await this.pc.createAnswer();
             await this.pc.setLocalDescription(answer);
-            logger.info('Created and set local description (answer)');
+            if (debugConfig.debug_connection) {
+                logger.info('Created and set local description (answer)');
+            }
 
             // Wait for ICE gathering to complete before sending answer
             // This ensures all candidates are included in the SDP
@@ -943,7 +986,9 @@ class BasiliskWebRTC {
     }
 
     createPeerConnection() {
-        logger.info('Creating RTCPeerConnection');
+        if (debugConfig.debug_connection) {
+            logger.info('Creating RTCPeerConnection');
+        }
 
         const config = {
             iceServers: [
@@ -966,7 +1011,9 @@ class BasiliskWebRTC {
     }
 
     onTrack(event) {
-        logger.info('Track received', { kind: event.track.kind, id: event.track.id });
+        if (debugConfig.debug_connection) {
+            logger.info('Track received', { kind: event.track.kind, id: event.track.id });
+        }
         connectionSteps.setDone('track');
         connectionSteps.setActive('frames');
         this.updateOverlayStatus('Receiving video stream...');
@@ -993,10 +1040,12 @@ class BasiliskWebRTC {
             this.updateWebRTCState('track-muted', event.track.muted ? 'Yes' : 'No');
 
             if (event.streams && event.streams[0]) {
-                logger.info('Attaching stream to video element', {
-                    streamId: event.streams[0].id,
-                    trackCount: event.streams[0].getTracks().length
-                });
+                if (debugConfig.debug_connection) {
+                    logger.info('Attaching stream to video element', {
+                        streamId: event.streams[0].id,
+                        trackCount: event.streams[0].getTracks().length
+                    });
+                }
                 this.video.srcObject = event.streams[0];
 
                 // Log all video element events for debugging
@@ -1147,7 +1196,9 @@ class BasiliskWebRTC {
 
     onIceConnectionStateChange() {
         const state = this.pc.iceConnectionState;
-        logger.info('ICE connection state', { state });
+        if (debugConfig.debug_connection) {
+            logger.info('ICE connection state', { state });
+        }
         this.updateWebRTCState('ice', state);
 
         if (state === 'connected' || state === 'completed') {
@@ -1169,7 +1220,9 @@ class BasiliskWebRTC {
 
     onConnectionStateChange() {
         const state = this.pc.connectionState;
-        logger.info('Connection state', { state });
+        if (debugConfig.debug_connection) {
+            logger.info('Connection state', { state });
+        }
         this.updateWebRTCState('pc', state);
 
         if (state === 'failed') {
@@ -1705,11 +1758,13 @@ async function logBrowserCapabilities() {
                 }
             };
             const h264Result = await navigator.mediaCapabilities.decodingInfo(h264Config);
-            logger.info('H.264 CBP L5.1 decode', {
-                supported: h264Result.supported,
-                smooth: h264Result.smooth,
-                powerEfficient: h264Result.powerEfficient
-            });
+            if (debugConfig.debug_connection) {
+                logger.info('H.264 CBP L5.1 decode', {
+                    supported: h264Result.supported,
+                    smooth: h264Result.smooth,
+                    powerEfficient: h264Result.powerEfficient
+                });
+            }
 
             // Also test Level 3.1 for comparison
             const h264L31Config = {
@@ -1723,11 +1778,13 @@ async function logBrowserCapabilities() {
                 }
             };
             const h264L31Result = await navigator.mediaCapabilities.decodingInfo(h264L31Config);
-            logger.info('H.264 CBP L3.1 decode', {
-                supported: h264L31Result.supported,
-                smooth: h264L31Result.smooth,
-                powerEfficient: h264L31Result.powerEfficient
-            });
+            if (debugConfig.debug_connection) {
+                logger.info('H.264 CBP L3.1 decode', {
+                    supported: h264L31Result.supported,
+                    smooth: h264L31Result.smooth,
+                    powerEfficient: h264L31Result.powerEfficient
+                });
+            }
         } catch (e) {
             logger.warn('MediaCapabilities check failed', { error: e.message });
         }
@@ -1740,10 +1797,12 @@ async function logBrowserCapabilities() {
         const videoCaps = RTCRtpReceiver.getCapabilities('video');
         if (videoCaps) {
             const h264Codecs = videoCaps.codecs.filter(c => c.mimeType.includes('H264') || c.mimeType.includes('h264'));
-            logger.info('WebRTC H.264 codecs', {
-                count: h264Codecs.length,
-                profiles: h264Codecs.map(c => c.sdpFmtpLine || 'default').join('; ')
-            });
+            if (debugConfig.debug_connection) {
+                logger.info('WebRTC H.264 codecs', {
+                    count: h264Codecs.length,
+                    profiles: h264Codecs.map(c => c.sdpFmtpLine || 'default').join('; ')
+                });
+            }
         }
     }
 
@@ -2442,7 +2501,8 @@ async function pollEmulatorStatus() {
 setInterval(pollEmulatorStatus, 2000);
 
 // Initialize on page load
-window.addEventListener('DOMContentLoaded', () => {
+window.addEventListener('DOMContentLoaded', async () => {
+    await fetchDebugConfig();  // Load debug flags from server
     initClient();
     pollEmulatorStatus();
 });

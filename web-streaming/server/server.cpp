@@ -64,6 +64,12 @@ static bool g_auto_start_emulator = true;
 static pid_t g_target_emulator_pid = 0;  // If specified, connect to this PID
 static CodecType g_server_codec = CodecType::PNG;  // Server-side codec preference (default: PNG)
 
+// Debug/verbosity flags
+static bool g_debug_connection = false;  // WebRTC, ICE, signaling logs
+static bool g_debug_mode_switch = false; // Mode/resolution/color depth changes
+static bool g_debug_perf = false;        // Performance stats, ping logs
+static bool g_debug_frames = false;      // Save frame dumps to disk (.ppm files)
+
 // Global state
 static std::atomic<bool> g_running(true);
 static std::atomic<bool> g_emulator_connected(false);
@@ -532,6 +538,11 @@ static bool start_emulator() {
         for (int fd = 3; fd < 1024; fd++) {
             close(fd);
         }
+
+        // Pass debug flags to emulator via environment variables
+        if (g_debug_mode_switch) setenv("MACEMU_DEBUG_MODE_SWITCH", "1", 1);
+        if (g_debug_perf) setenv("MACEMU_DEBUG_PERF", "1", 1);
+        if (g_debug_frames) setenv("MACEMU_DEBUG_FRAMES", "1", 1);
 
         // Execute emulator with prefs file
         // BasiliskII uses --config, SheepShaver uses --prefs
@@ -1037,6 +1048,18 @@ private:
         }
 
         // API endpoints
+        if (path == "/api/config" && method == "GET") {
+            // Return debug configuration flags
+            std::ostringstream json;
+            json << "{";
+            json << "\"debug_connection\": " << (g_debug_connection ? "true" : "false");
+            json << ", \"debug_mode_switch\": " << (g_debug_mode_switch ? "true" : "false");
+            json << ", \"debug_perf\": " << (g_debug_perf ? "true" : "false");
+            json << "}";
+            send_json_response(fd, json.str());
+            return;
+        }
+
         if (path == "/api/storage" && method == "GET") {
             std::string json_body = get_storage_json();
             send_json_response(fd, json_body);
@@ -1082,10 +1105,10 @@ private:
             if (g_video_shm) {
                 json << ", \"video\": {\"width\": " << g_video_shm->width;
                 json << ", \"height\": " << g_video_shm->height;
-                json << ", \"frame_count\": " << ATOMIC_LOAD(g_video_shm->frame_count);
+                json << ", \"frame_count\": " << g_video_shm->frame_count;  // Plain read, stats only
                 json << ", \"state\": " << g_video_shm->state << "}";
 
-                // Mouse latency from emulator (stored as x10 for 0.1ms precision)
+                // Mouse latency from emulator (atomic - can be updated by stats thread)
                 uint32_t latency_x10 = ATOMIC_LOAD(g_video_shm->mouse_latency_avg_ms);
                 uint32_t latency_samples = ATOMIC_LOAD(g_video_shm->mouse_latency_samples);
                 json << ", \"mouse_latency_ms\": " << std::fixed << std::setprecision(1) << (latency_x10 / 10.0);
@@ -1575,8 +1598,10 @@ private:
             peer->codec = g_server_codec;
             const char* codec_name = (g_server_codec == CodecType::H264) ? "h264" :
                                      (g_server_codec == CodecType::PNG) ? "png" : "raw";
-            fprintf(stderr, "[WebRTC] Peer %s using %s codec (server-configured)\n",
-                    peer_id.c_str(), codec_name);
+            if (g_debug_connection) {
+                fprintf(stderr, "[WebRTC] Peer %s using %s codec (server-configured)\n",
+                        peer_id.c_str(), codec_name);
+            }
 
             // Send acknowledgment with codec info so client knows what to expect
             std::string ack = "{\"type\":\"connected\",\"peer_id\":\"" + peer_id +
@@ -1658,7 +1683,9 @@ private:
                     case rtc::PeerConnection::State::Failed: state_str = "Failed"; break;
                     case rtc::PeerConnection::State::Closed: state_str = "Closed"; break;
                 }
-                fprintf(stderr, "[WebRTC] Peer %s state: %s\n", peer->id.c_str(), state_str);
+                if (g_debug_connection) {
+                    fprintf(stderr, "[WebRTC] Peer %s state: %s\n", peer->id.c_str(), state_str);
+                }
             });
 
             peer->pc->onIceStateChange([peer](rtc::PeerConnection::IceState state) {
@@ -1672,7 +1699,9 @@ private:
                     case rtc::PeerConnection::IceState::Failed: state_str = "Failed"; break;
                     case rtc::PeerConnection::IceState::Closed: state_str = "Closed"; break;
                 }
-                fprintf(stderr, "[WebRTC] Peer %s ICE state: %s\n", peer->id.c_str(), state_str);
+                if (g_debug_connection) {
+                    fprintf(stderr, "[WebRTC] Peer %s ICE state: %s\n", peer->id.c_str(), state_str);
+                }
             });
 
             // Add data channel for input
@@ -1683,12 +1712,14 @@ private:
             peer->data_channel->onMessage([this](auto data) {
                 if (std::holds_alternative<std::string>(data)) {
                     const std::string& msg = std::get<std::string>(data);
-                    static int msg_count = 0;
-                    if (msg_count++ < 5) {
-                        fprintf(stderr, "[WebRTC] DataChannel message: '%s'\n", msg.c_str());
+                    if (g_debug_connection) {
+                        static int msg_count = 0;
+                        if (msg_count++ < 5) {
+                            fprintf(stderr, "[WebRTC] DataChannel message: '%s'\n", msg.c_str());
+                        }
                     }
                     handle_input(msg);
-                } else {
+                } else if (g_debug_connection) {
                     fprintf(stderr, "[WebRTC] DataChannel received binary data\n");
                 }
             });
@@ -1716,8 +1747,10 @@ private:
             if (it != ws_to_peer_id_.end()) {
                 auto peer = peers_[it->second];
                 std::string sdp = json_get_string(msg, "sdp");
-                fprintf(stderr, "[WebRTC] Received answer from %s (sdp length=%zu)\n",
-                        peer->id.c_str(), sdp.size());
+                if (g_debug_connection) {
+                    fprintf(stderr, "[WebRTC] Received answer from %s (sdp length=%zu)\n",
+                            peer->id.c_str(), sdp.size());
+                }
 
                 // Set remote description
                 try {
@@ -1851,8 +1884,10 @@ private:
                 if (sscanf(args, "%u,%lf", &sequence, &ts) == 2) {
                     uint64_t timestamp_ms = static_cast<uint64_t>(ts);
                     bool success = send_ping_input(sequence, timestamp_ms);
-                    fprintf(stderr, "[Server] Ping #%u (t1=%.1fms) forwarded to emulator: %s\n",
-                            sequence, ts, success ? "OK" : "FAILED");
+                    if (g_debug_perf) {
+                        fprintf(stderr, "[Server] Ping #%u (t1=%.1fms) forwarded to emulator: %s\n",
+                                sequence, ts, success ? "OK" : "FAILED");
+                    }
                 } else {
                     fprintf(stderr, "[Server] ERROR: Failed to parse ping message: '%s'\n", args);
                 }
@@ -1881,7 +1916,6 @@ private:
  */
 
 static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncoder& png_encoder) {
-    uint64_t last_frame_count = 0;
     auto last_stats_time = std::chrono::steady_clock::now();
     auto last_emu_check = std::chrono::steady_clock::now();
     auto last_scan_time = std::chrono::steady_clock::now();
@@ -1890,11 +1924,12 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
     // Track input counts between stats intervals
     uint64_t last_mouse_move = 0;
 
-    // Create epoll instance for low-latency event notification
+    // Create epoll instance for low-latency event notification (REQUIRED)
     int epoll_fd = epoll_create1(0);
     if (epoll_fd < 0) {
-        fprintf(stderr, "Video: Failed to create epoll: %s (falling back to polling)\n", strerror(errno));
-        epoll_fd = -1;
+        fprintf(stderr, "Video: FATAL: Failed to create epoll: %s\n", strerror(errno));
+        fprintf(stderr, "Video: epoll is required for frame synchronization (no polling fallback)\n");
+        return;
     }
     int current_eventfd = -1;  // Track which eventfd is registered
 
@@ -1967,7 +2002,6 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
                 // Connection closed
                 fprintf(stderr, "Video: Emulator disconnected\n");
                 disconnect_from_emulator();
-                last_frame_count = 0;
             }
         }
 
@@ -1978,9 +2012,7 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
         }
 
         // Register eventfd with epoll if we just connected to emulator
-        if (epoll_fd >= 0 && g_frame_ready_eventfd >= 0 &&
-            current_eventfd != g_frame_ready_eventfd) {
-
+        if (g_frame_ready_eventfd >= 0 && current_eventfd != g_frame_ready_eventfd) {
             // Remove old eventfd if any
             if (current_eventfd >= 0) {
                 epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current_eventfd, nullptr);
@@ -1992,44 +2024,47 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
             ev.data.fd = g_frame_ready_eventfd;
             if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, g_frame_ready_eventfd, &ev) == 0) {
                 current_eventfd = g_frame_ready_eventfd;
-                fprintf(stderr, "Video: Using epoll with eventfd %d for low-latency frame notification\n", current_eventfd);
+                fprintf(stderr, "Video: Registered eventfd %d with epoll\n", current_eventfd);
             } else {
-                fprintf(stderr, "Video: Failed to add eventfd %d to epoll: %s\n",
+                fprintf(stderr, "Video: FATAL: Failed to add eventfd %d to epoll: %s\n",
                         g_frame_ready_eventfd, strerror(errno));
-            }
-        }
-
-        // Check for new frame
-        uint64_t current_count = ATOMIC_LOAD(g_video_shm->frame_count);
-        if (current_count == last_frame_count) {
-            // Use epoll for low-latency notification if available
-            if (epoll_fd >= 0 && current_eventfd >= 0) {
-                struct epoll_event events[1];
-                // Wait up to 5ms for frame ready event
-                int n = epoll_wait(epoll_fd, events, 1, 5);
-                if (n > 0) {
-                    // Consume the eventfd value (required for semaphore mode)
-                    uint64_t val;
-                    ssize_t ret = read(current_eventfd, &val, sizeof(val));
-                    (void)ret;  // Suppress unused warning
-                }
+                // This is fatal - can't proceed without eventfd
+                disconnect_from_emulator();
                 continue;
             }
-            // Fallback to polling if epoll not available
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+
+        // Wait for new frame via epoll (blocking on eventfd)
+        if (current_eventfd < 0) {
+            // No eventfd registered yet, wait for emulator connection
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
-        last_frame_count = current_count;
+
+        struct epoll_event events[1];
+        // Wait up to 5ms for frame ready event
+        int n = epoll_wait(epoll_fd, events, 1, 5);
+        if (n > 0) {
+            // Frame ready! Consume the eventfd value (required for semaphore mode)
+            // This read() provides memory barrier - all emulator writes before write(eventfd) are now visible
+            uint64_t val;
+            ssize_t ret = read(current_eventfd, &val, sizeof(val));
+            (void)ret;  // Suppress unused warning
+        } else {
+            // Timeout or error - continue loop
+            continue;
+        }
 
         // Latency measurement: time from emulator frame completion to now
-        uint64_t frame_timestamp_us = ATOMIC_LOAD(g_video_shm->timestamp_us);
+        // Plain read - synchronized by eventfd read above
+        uint64_t frame_timestamp_us = g_video_shm->timestamp_us;
 
         // Use CLOCK_REALTIME to match the emulator's timestamp (both in same clock domain)
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         uint64_t server_now_us = (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 
-        // Read frame dimensions
+        // Read frame dimensions (plain reads - synchronized by eventfd)
         uint32_t width = g_video_shm->width;
         uint32_t height = g_video_shm->height;
 
@@ -2060,11 +2095,11 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
 
         // Encode and send to PNG peers using dirty rects from emulator
         if (webrtc.has_codec_peer(CodecType::PNG)) {
-            // Read dirty rect from SHM (computed by emulator during frame conversion)
-            uint32_t dirty_x = ATOMIC_LOAD(g_video_shm->dirty_x);
-            uint32_t dirty_y = ATOMIC_LOAD(g_video_shm->dirty_y);
-            uint32_t dirty_width = ATOMIC_LOAD(g_video_shm->dirty_width);
-            uint32_t dirty_height = ATOMIC_LOAD(g_video_shm->dirty_height);
+            // Read dirty rect from SHM (plain reads - synchronized by eventfd)
+            uint32_t dirty_x = g_video_shm->dirty_x;
+            uint32_t dirty_y = g_video_shm->dirty_y;
+            uint32_t dirty_width = g_video_shm->dirty_width;
+            uint32_t dirty_height = g_video_shm->dirty_height;
 
             // Force full frame if keyframe requested (new peer connected)
             if (keyframe_requested) {
@@ -2074,7 +2109,31 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
                 dirty_height = height;
             }
 
-            // Only encode if there are changes (dirty_width > 0)
+            // Heartbeat mechanism: Send tiny frame to carry ping echoes even when screen is static
+            // This prevents ping responses from being delayed indefinitely on idle screens
+            static auto last_heartbeat = std::chrono::steady_clock::now();
+            if (dirty_width == 0 || dirty_height == 0) {
+                // Check if there's a pending ping echo
+                uint32_t ping_seq = ATOMIC_LOAD(g_video_shm->ping_sequence);
+                if (ping_seq > 0) {
+                    auto heartbeat_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_heartbeat);
+                    // Send heartbeat at most once per second to avoid spam
+                    if (heartbeat_elapsed.count() >= 1000) {
+                        // Send a tiny 1x1 pixel frame just to carry the ping echo
+                        dirty_x = 0;
+                        dirty_y = 0;
+                        dirty_width = 1;
+                        dirty_height = 1;
+                        last_heartbeat = now;
+                        // Note: This encodes/sends 1 pixel which is ~100 bytes - negligible overhead
+                    }
+                }
+            } else {
+                // Screen is updating, reset heartbeat timer
+                last_heartbeat = now;
+            }
+
+            // Only encode if there are changes (dirty_width > 0) or heartbeat triggered
             // Ping echoes are carried in the frame metadata header of any frame being sent
             if (dirty_width > 0 && dirty_height > 0) {
                 EncodedFrame frame;
@@ -2133,41 +2192,45 @@ static void video_loop(WebRTCServer& webrtc, H264Encoder& h264_encoder, PNGEncod
             float avg_shm_ms = latency_samples > 0 ? (total_shm_latency_us / latency_samples) / 1000.0f : 0;
             float avg_encode_ms = latency_samples > 0 ? (total_encode_latency_us / latency_samples) / 1000.0f : 0;
 
-            fprintf(stderr, "[Server] fps=%.1f peers=%d | video: shm=%.1fms enc=%.1fms | mouse: rate=%.0f/s | emu=%s pid=%d\n",
-                    fps, webrtc.peer_count(),
-                    avg_shm_ms, avg_encode_ms,
-                    mouse_rate,
-                    g_emulator_connected ? "connected" : "scanning",
-                    g_emulator_pid);
+            if (g_debug_perf) {
+                fprintf(stderr, "[Server] fps=%.1f peers=%d | video: shm=%.1fms enc=%.1fms | mouse: rate=%.0f/s | emu=%s pid=%d\n",
+                        fps, webrtc.peer_count(),
+                        avg_shm_ms, avg_encode_ms,
+                        mouse_rate,
+                        g_emulator_connected ? "connected" : "scanning",
+                        g_emulator_pid);
+            }
 
             // Reset latency counters
             total_shm_latency_us = 0;
             total_encode_latency_us = 0;
             latency_samples = 0;
 
-            // Save frame as PPM (readable image format) for debugging
-            static int frame_save_count = 0;
-            if (frame_save_count < 3) {  // Only save first 3 frames
-                char filename[64];
-                snprintf(filename, sizeof(filename), "frame_%d_%dx%d.ppm", frame_save_count, width, height);
-                FILE* f = fopen(filename, "wb");
-                if (f) {
-                    // Convert BGRA frame to RGB and save as PPM
-                    // BGRA = bytes B,G,R,A (libyuv "ARGB")
-                    fprintf(f, "P6\n%d %d\n255\n", width, height);
-                    for (uint32_t row = 0; row < height; row++) {
-                        for (uint32_t col = 0; col < width; col++) {
-                            const uint8_t* pixel = frame_data + row * stride + col * 4;
-                            uint8_t B = pixel[0];
-                            uint8_t G = pixel[1];
-                            uint8_t R = pixel[2];
-                            uint8_t rgb[3] = {R, G, B};
-                            fwrite(rgb, 1, 3, f);
+            // Save frame as PPM (readable image format) for debugging (disabled by default)
+            if (g_debug_frames) {
+                static int frame_save_count = 0;
+                if (frame_save_count < 3) {  // Only save first 3 frames
+                    char filename[64];
+                    snprintf(filename, sizeof(filename), "frame_%d_%dx%d.ppm", frame_save_count, width, height);
+                    FILE* f = fopen(filename, "wb");
+                    if (f) {
+                        // Convert BGRA frame to RGB and save as PPM
+                        // BGRA = bytes B,G,R,A (libyuv "ARGB")
+                        fprintf(f, "P6\n%d %d\n255\n", width, height);
+                        for (uint32_t row = 0; row < height; row++) {
+                            for (uint32_t col = 0; col < width; col++) {
+                                const uint8_t* pixel = frame_data + row * stride + col * 4;
+                                uint8_t B = pixel[0];
+                                uint8_t G = pixel[1];
+                                uint8_t R = pixel[2];
+                                uint8_t rgb[3] = {R, G, B};
+                                fwrite(rgb, 1, 3, f);
+                            }
                         }
+                        fclose(f);
+                        fprintf(stderr, "[Server] Saved debug frame: %s (BGRA)\n", filename);
+                        frame_save_count++;
                     }
-                    fclose(f);
-                    fprintf(stderr, "[Server] Saved debug frame: %s (BGRA)\n", filename);
-                    frame_save_count++;
                 }
             }
 
@@ -2202,6 +2265,11 @@ static void print_usage(const char* program) {
     fprintf(stderr, "  --pid PID               Connect to specific emulator PID\n");
     fprintf(stderr, "  --roms PATH             ROMs directory (default: storage/roms)\n");
     fprintf(stderr, "  --images PATH           Disk images directory (default: storage/images)\n");
+    fprintf(stderr, "\nDebug Options:\n");
+    fprintf(stderr, "  --debug-connection      Show WebRTC/ICE/signaling logs\n");
+    fprintf(stderr, "  --debug-mode-switch     Show mode/resolution/color depth changes\n");
+    fprintf(stderr, "  --debug-perf            Show performance stats and ping logs\n");
+    fprintf(stderr, "  --debug-frames          Save frame dumps to disk (.ppm files)\n");
     fprintf(stderr, "\nArchitecture:\n");
     fprintf(stderr, "  - Emulator creates SHM at /macemu-video-{PID}\n");
     fprintf(stderr, "  - Emulator creates socket at /tmp/macemu-{PID}.sock\n");
@@ -2221,15 +2289,19 @@ static void print_usage(const char* program) {
 int main(int argc, char* argv[]) {
     // Parse command line
     static struct option long_options[] = {
-        {"help",         no_argument,       0, 'h'},
-        {"http-port",    required_argument, 0, 'p'},
-        {"signaling",    required_argument, 0, 's'},
-        {"roms",         required_argument, 0, 'r'},
-        {"images",       required_argument, 0, 'i'},
-        {"emulator",     required_argument, 0, 'e'},
-        {"prefs",        required_argument, 0, 'P'},
-        {"no-auto-start", no_argument,      0, 'n'},
-        {"pid",          required_argument, 0, 1000},
+        {"help",             no_argument,       0, 'h'},
+        {"http-port",        required_argument, 0, 'p'},
+        {"signaling",        required_argument, 0, 's'},
+        {"roms",             required_argument, 0, 'r'},
+        {"images",           required_argument, 0, 'i'},
+        {"emulator",         required_argument, 0, 'e'},
+        {"prefs",            required_argument, 0, 'P'},
+        {"no-auto-start",    no_argument,       0, 'n'},
+        {"pid",              required_argument, 0, 1000},
+        {"debug-connection", no_argument,       0, 1001},
+        {"debug-mode-switch", no_argument,      0, 1002},
+        {"debug-perf",       no_argument,       0, 1003},
+        {"debug-frames",     no_argument,       0, 1004},
         {0, 0, 0, 0}
     };
 
@@ -2262,6 +2334,18 @@ int main(int argc, char* argv[]) {
                 break;
             case 1000:
                 g_target_emulator_pid = atoi(optarg);
+                break;
+            case 1001:
+                g_debug_connection = true;
+                break;
+            case 1002:
+                g_debug_mode_switch = true;
+                break;
+            case 1003:
+                g_debug_perf = true;
+                break;
+            case 1004:
+                g_debug_frames = true;
                 break;
             default:
                 print_usage(argv[0]);
