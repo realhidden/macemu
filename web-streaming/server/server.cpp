@@ -1596,7 +1596,21 @@ public:
     void disconnect_all_peers() {
         std::lock_guard<std::mutex> lock(peers_mutex_);
         fprintf(stderr, "[WebRTC] Disconnecting all peers (%d) due to emulator restart\n", (int)peers_.size());
-        // Close all peer connections - this will trigger browser reconnections
+
+        // Explicitly close all peer connections to trigger browser reconnections
+        for (auto& pair : peers_) {
+            auto& peer = pair.second;
+            if (peer->pc) {
+                peer->pc->close();
+            }
+            if (peer->data_channel) {
+                peer->data_channel->close();
+            }
+            if (peer->video_track) {
+                peer->video_track->close();
+            }
+        }
+
         peers_.clear();
         ws_to_peer_id_.clear();
         peer_count_.store(0);
