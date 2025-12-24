@@ -311,8 +311,9 @@ static void input_thread_func()
         // Process input
         switch (input.hdr.type) {
             case MACEMU_INPUT_KEY:
-                ADBKeyDown(input.key.mac_keycode);
-                if (!(input.key.hdr.flags & MACEMU_KEY_DOWN)) {
+                if (input.key.hdr.flags & MACEMU_KEY_DOWN) {
+                    ADBKeyDown(input.key.mac_keycode);
+                } else {
                     ADBKeyUp(input.key.mac_keycode);
                 }
                 break;
