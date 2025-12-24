@@ -50,3 +50,24 @@ project.xcworkspace/
 web-streaming/storage/
 web-streaming/basilisk_ii.prefs
 web-streaming/BasiliskII
+web-streaming/bin/
+web-streaming/libyuv/
+
+#
+# Autoconf generated files
+#
+confdefs.h
+conftest
+conftest.c
+conftest.dSYM/
+
+#
+# Emulator prefs and logs
+#
+*.prefs
+*.log
+
+#
+# Claude Code
+#
+.claude/
